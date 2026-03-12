@@ -1,0 +1,16 @@
+.env/
+.venv/
+env/
+venv/
+conda-env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+data/output_png/*
+!data/output_png/.gitkeep
+
+data/output_sxm/*
+!data/output_sxm/.gitkeep

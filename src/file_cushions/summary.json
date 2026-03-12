@@ -1,0 +1,12 @@
+{
+  "file": "C:\\Users\\rnpla\\Desktop\\stm\\sxm_need\\try_display_sxm_file\\Co_BN_Rh(111)_2013-06-10_08-45-38_img.sxm",
+  "SCAN_PIXELS": "240 240",
+  "planes": 4,
+  "expected_payload_bytes": 921600,
+  "j_after_marker": 4032,
+  "post_end_bytes_len": 3,
+  "pad_len": 1,
+  "data_offset": 4036,
+  "data_end": 925636,
+  "tail_bytes_len": 1
+}

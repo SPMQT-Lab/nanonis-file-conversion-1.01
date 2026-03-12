@@ -1,0 +1,74 @@
+{
+  "marker": {
+    "prefix": ":",
+    "suffix": ":",
+    "newline_after_marker": true
+  },
+  "line_ending": "\n",
+  "block_order": [
+    "NANONIS_VERSION",
+    "SCANIT_TYPE",
+    "REC_DATE",
+    "REC_TIME",
+    "42",
+    "REC_TEMP",
+    "ACQ_TIME",
+    "SCAN_PIXELS",
+    "SCAN_FILE",
+    "SCAN_TIME",
+    "SCAN_RANGE",
+    "SCAN_OFFSET",
+    "SCAN_ANGLE",
+    "SCAN_DIR",
+    "BIAS",
+    "Z-CONTROLLER",
+    "COMMENT",
+    "DATA_INFO"
+  ],
+  "between_blocks": "\n",
+  "key_case": "UPPER",
+  "numeric_hints": {
+    "SCAN_PIXELS": {
+      "style": "integer",
+      "upper_E": false,
+      "precision": 0
+    },
+    "SCAN_RANGE": {
+      "style": "scientific",
+      "upper_E": true,
+      "precision": 6
+    },
+    "SCAN_OFFSET": {
+      "style": "scientific",
+      "upper_E": true,
+      "precision": 6
+    },
+    "SCAN_ANGLE": {
+      "style": "scientific",
+      "upper_E": true,
+      "precision": 3
+    },
+    "BIAS": {
+      "style": "scientific",
+      "upper_E": true,
+      "precision": 3
+    }
+  },
+  "data_info": {
+    "columns": [
+      "",
+      "Channel",
+      "Name",
+      "Unit",
+      "Direction",
+      "Calibration",
+      "Offset"
+    ],
+    "delimiter": "\\t",
+    "include_header_row": true
+  },
+  "filler": {
+    "char": " ",
+    "strategy": "fit_to_pre_length"
+  }
+}

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanonis-file-conversion"
+version = "0.1.0"
+description = "CLI tools for converting Nanonis STM image .dat files to .sxm and preview PNG outputs."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy",
+  "pillow",
+]
+
+[project.scripts]
+dat-png = "nanonis_tools.dats_to_pngs:main"
+dat-sxm = "nanonis_tools.dat_sxm_cli:main"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+include = ["nanonis_tools"]
