@@ -4,19 +4,15 @@
 
 This repository is dedicated towards NANONIS raw data file conversion, to enable the usage of image analysis software that is built for one specific raw data file format, for several file formats. Currently the file conversions supported are:
 
-* NANONIS images as .dat -> .sxm 
-* NANONIS imagesd as .dat -> .png
+* NANONIS images as .dat -> .sxm
+* NANONIS images as .dat -> .png
 
-We have two command line tools that implement the above. 
+We have two command line tools that implement the above.
 
 - `dat-png` converts image `.dat` files into PNG previews
 - `dat-sxm` converts image `.dat` files into `.sxm` files
 
 Both commands accept either a single `.dat` file or a directory of `.dat` files.
-
-This public repository is derived from a refined lab-internal project hence the few commits. 
-
-Co-authorship note: the CLI-oriented workflow was co-authored with Gustavo Campi.
 
 ## Installation
 
@@ -33,7 +29,6 @@ That installs these commands into your active Python environment:
 - `dat-png`
 - `dat-sxm`
 
-
 ## Usage
 
 ### Use the built-in default paths
@@ -44,13 +39,6 @@ The repository ships with two sample `.dat` files in [data/sample_input](data/sa
 dat-png
 dat-sxm
 ```
-
-Default paths are defined here:
-
-- [nanonis_tools/dats_to_pngs.py](nanonis_tools/dats_to_pngs.py)
-  `DEFAULT_INPUT_DIR`, `DEFAULT_OUTPUT_DIR`
-- [nanonis_tools/dat_sxm_cli.py](nanonis_tools/dat_sxm_cli.py)
-  `DEFAULT_INPUT_DIR`, `DEFAULT_OUTPUT_DIR`, `DEFAULT_CUSHION_DIR`
 
 ### Supply your own paths
 
@@ -72,17 +60,35 @@ If your cushion files are stored somewhere else, provide them explicitly:
 dat-sxm --input-dir path/to/input --output-dir path/to/output --cushion-dir path/to/file_cushions
 ```
 
-The cushion paths exist as particular byte sequences that all nanonis .sxm images have. they are provided in `\src\file_cushions`. The cushion path is inserted default relative to the repo root so you shouldnt need to edit any default file paths with respect to those. 
+### Optional flags
 
+Both `dat-png` and `dat-sxm` support these additional flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--clip-low` | `1.0` | Lower percentile for contrast clipping |
+| `--clip-high` | `99.0` | Upper percentile for contrast clipping |
+| `--verbose` | off | Enable debug logging (shows scaling factors, saved files, etc.) |
+
+Example with custom contrast and verbose output:
+
+```bash
+dat-png --input-dir path/to/input --output-dir path/to/output --clip-low 2 --clip-high 98 --verbose
+```
 
 ## Repository Contents
 
 - [nanonis_tools](nanonis_tools): installable converter source code
-- [scripts](scripts): thin wrappers for direct script execution
+  - `common.py`: shared utilities (DAC scaling, header parsing, image processing)
+  - `dats_to_pngs.py`: PNG conversion tool
+  - `dat_sxm_cli.py`: SXM conversion tool
 - [src/file_cushions](src/file_cushions): required layout assets for `.sxm` generation
 - [data/sample_input](data/sample_input): two small example `.dat` files
+- [tests](tests): pytest test suite (63 tests)
 
 ## Notes
 
 - `dat-sxm` writes output files using the input filename stem.
-- The current `.sxm` timestamp parsing expects filenames of the form `AyyMMdd.HHmmss.dat`.
+- The `.sxm` timestamp parsing expects filenames of the form `AyyMMdd.HHmmss.dat` (e.g. `A250320.191933.dat`).
+- The cushion files in `src/file_cushions` encode the binary structure of the `.sxm` format and are required for SXM generation. The path defaults to the repo root so no changes are needed unless you move them.
+- If a batch run encounters errors, a summary `errors.json` is written to the output directory.
