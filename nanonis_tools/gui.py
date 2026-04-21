@@ -5,8 +5,10 @@ import logging
 import queue
 import threading
 import tkinter as tk
+from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog
+from typing import Callable, List, Optional
 import webbrowser
 
 from PIL import Image, ImageTk
@@ -17,9 +19,9 @@ DEFAULT_CUSHION = REPO_ROOT / "src" / "file_cushions"
 LOGO_PATH       = REPO_ROOT / "assets" / "logo.png"
 GITHUB_URL      = "https://github.com/SPMQT-Lab/Createc-to-Nanonis-file-conversion"
 
-NAVBAR_BG  = "#3273dc"
-NAVBAR_FG  = "#ffffff"
-NAVBAR_H   = 58
+NAVBAR_BG = "#3273dc"
+NAVBAR_FG = "#ffffff"
+NAVBAR_H  = 58
 
 THEMES = {
     "dark": {
@@ -41,6 +43,11 @@ THEMES = {
         "main_bg":    "#1e1e2e",
         "status_bg":  "#313244",
         "status_fg":  "#6c7086",
+        "card_bg":    "#313244",
+        "card_sel":   "#89b4fa",
+        "card_fg":    "#cdd6f4",
+        "tab_act":    "#45475a",
+        "tab_inact":  "#313244",
     },
     "light": {
         "bg":         "#f8f9fa",
@@ -61,9 +68,86 @@ THEMES = {
         "main_bg":    "#eef6fc",
         "status_bg":  "#f5f5f5",
         "status_fg":  "#6c757d",
+        "card_bg":    "#d0e8f8",
+        "card_sel":   "#3273dc",
+        "card_fg":    "#1e1e2e",
+        "tab_act":    "#ffffff",
+        "tab_inact":  "#d8eaf8",
     },
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Data model
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class DatGroup:
+    stem:    str
+    pngs:    List[Path] = field(default_factory=list)
+    sxm:     Optional[Path] = None
+    preview: Optional[Path] = None   # preferred Z_forward PNG
+
+
+def parse_sxm_header(sxm_path: Path) -> dict:
+    """Read the ASCII header section of an .sxm file into a key->value dict."""
+    params: dict = {}
+    current_key: Optional[str] = None
+    lines_buf: List[str] = []
+
+    def _flush():
+        if current_key is not None:
+            params[current_key] = " ".join(lines_buf).strip()
+
+    try:
+        with open(sxm_path, "rb") as fh:
+            for raw in fh:
+                if raw.strip() == b":SCANIT_END:":
+                    break
+                line = raw.decode("latin-1", errors="replace").rstrip("\r\n")
+                if line.startswith(":") and line.endswith(":") and len(line) > 2:
+                    _flush()
+                    current_key = line[1:-1]
+                    lines_buf = []
+                elif current_key is not None:
+                    s = line.strip()
+                    if s:
+                        lines_buf.append(s)
+        _flush()
+    except Exception:
+        pass
+    return params
+
+
+def scan_output_folder(root: Path) -> List[DatGroup]:
+    """Find DatGroups under a ProbeFlow output folder."""
+    groups: dict = {}
+    root = Path(root)
+
+    for png in sorted(root.rglob("*.png")):
+        stem = png.parents[1].name if png.parent.name == "pngs" else png.parent.name
+        if stem not in groups:
+            groups[stem] = {"pngs": [], "sxm": None}
+        groups[stem]["pngs"].append(png)
+
+    for sxm in sorted(root.rglob("*.sxm")):
+        s = sxm.stem
+        if s in groups:
+            groups[s]["sxm"] = sxm
+
+    result = []
+    for stem, data in sorted(groups.items()):
+        pngs = sorted(data["pngs"])
+        preview = (
+            next((p for p in pngs if "Z" in p.name and "forward" in p.name), None)
+            or (pngs[0] if pngs else None)
+        )
+        result.append(DatGroup(stem=stem, pngs=pngs, sxm=data["sxm"], preview=preview))
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
     defaults = {
@@ -85,6 +169,10 @@ def save_config(cfg: dict) -> None:
         pass
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging helper
+# ─────────────────────────────────────────────────────────────────────────────
+
 class QueueHandler(logging.Handler):
     def __init__(self, q: queue.Queue):
         super().__init__()
@@ -93,6 +181,129 @@ class QueueHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         self.q.put(record)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Thumbnail grid widget
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ThumbnailGrid(tk.Frame):
+    CARD_W = 164
+    CARD_H = 148
+    IMG_W  = 148
+    IMG_H  = 116
+    GAP    = 10
+
+    def __init__(self, parent, on_select: Callable, theme: dict, **kw):
+        super().__init__(parent, **kw)
+        self._on_select = on_select
+        self._t = theme
+        self._groups: List[DatGroup] = []
+        self._photos: dict = {}
+        self._selected: Optional[str] = None
+
+        self._canvas = tk.Canvas(self, highlightthickness=0, bd=0)
+        self._vsb = tk.Scrollbar(self, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._vsb.set)
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._vsb.pack(side="right", fill="y")
+
+        self._canvas.bind("<Configure>", lambda e: self._layout())
+        self._canvas.bind("<MouseWheel>", self._scroll)
+        self._canvas.bind("<Button-4>",   self._scroll)
+        self._canvas.bind("<Button-5>",   self._scroll)
+
+    def load(self, groups: List[DatGroup]) -> None:
+        self._groups = groups
+        self._photos.clear()
+        self._selected = None
+        self._canvas.delete("all")
+        for g in groups:
+            self._photos[g.stem] = self._make_photo(g.preview)
+        self._layout()
+
+    def _make_photo(self, path: Optional[Path]) -> Optional[ImageTk.PhotoImage]:
+        if not path or not path.exists():
+            return None
+        try:
+            img = Image.open(path).convert("RGB")
+            img.thumbnail((self.IMG_W, self.IMG_H), Image.LANCZOS)
+            return ImageTk.PhotoImage(img)
+        except Exception:
+            return None
+
+    def _layout(self) -> None:
+        cw = self._canvas.winfo_width()
+        if cw < 10:
+            self.after(50, self._layout)
+            return
+        cols = max(1, (cw + self.GAP) // (self.CARD_W + self.GAP))
+        t = self._t
+        self._canvas.delete("all")
+
+        for i, g in enumerate(self._groups):
+            row, col = divmod(i, cols)
+            x0 = col * (self.CARD_W + self.GAP) + self.GAP
+            y0 = row * (self.CARD_H + self.GAP) + self.GAP
+            x1, y1 = x0 + self.CARD_W, y0 + self.CARD_H
+            sel = (g.stem == self._selected)
+
+            self._canvas.create_rectangle(
+                x0, y0, x1, y1,
+                fill=t["card_sel"] if sel else t["card_bg"],
+                outline=t["accent_bg"] if sel else t["sep"],
+                width=2 if sel else 1,
+                tags=("card", f"s:{g.stem}"),
+            )
+            photo = self._photos.get(g.stem)
+            if photo:
+                self._canvas.create_image(
+                    x0 + self.CARD_W // 2, y0 + self.IMG_H // 2 + 4,
+                    image=photo, tags=("card", f"s:{g.stem}"),
+                )
+            label = g.stem if len(g.stem) <= 20 else g.stem[:18] + ".."
+            self._canvas.create_text(
+                x0 + self.CARD_W // 2, y1 - 11,
+                text=label, font=("Helvetica", 7),
+                fill="#ffffff" if sel else t["card_fg"],
+                tags=("card", f"s:{g.stem}"),
+            )
+
+        total_rows = max(1, (len(self._groups) + cols - 1) // cols)
+        total_h = total_rows * (self.CARD_H + self.GAP) + self.GAP
+        self._canvas.configure(scrollregion=(0, 0, cw, max(total_h, 1)))
+        self._canvas.tag_bind("card", "<Button-1>", self._on_click)
+
+    def _on_click(self, event: tk.Event) -> None:
+        items = self._canvas.find_closest(event.x, event.y)
+        if not items:
+            return
+        for tag in self._canvas.gettags(items[0]):
+            if tag.startswith("s:"):
+                stem = tag[2:]
+                for g in self._groups:
+                    if g.stem == stem:
+                        self._selected = stem
+                        self._layout()
+                        self._on_select(g)
+                        return
+
+    def _scroll(self, event: tk.Event) -> None:
+        if event.num == 4:
+            self._canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self._canvas.yview_scroll(1, "units")
+        else:
+            self._canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    def apply_theme(self, t: dict) -> None:
+        self._t = t
+        self._canvas.configure(bg=t["main_bg"])
+        self._layout()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# About popup
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _show_about(parent: tk.Tk, dark: bool) -> None:
     t = THEMES["dark" if dark else "light"]
@@ -122,7 +333,8 @@ def _show_about(parent: tk.Tk, dark: bool) -> None:
     row("Createc -> Nanonis File Conversion", 10, color=t["sub_fg"])
     tk.Frame(win, height=1, bg=t["sep"]).pack(fill="x", padx=24, pady=10)
     row("Developed at SPMQT-Lab", 10, bold=True)
-    row("Under the supervision of Dr. Peter Jacobson\nThe University of Queensland", 9, color=t["sub_fg"])
+    row("Under the supervision of Dr. Peter Jacobson\nThe University of Queensland", 9,
+        color=t["sub_fg"])
     tk.Frame(win, height=1, bg=t["sep"]).pack(fill="x", padx=24, pady=10)
     row("Original code by Rohan Platts", 10, bold=True)
     row("The core conversion algorithms were built by Rohan Platts.\n"
@@ -131,21 +343,26 @@ def _show_about(parent: tk.Tk, dark: bool) -> None:
     tk.Frame(win, height=1, bg=t["sep"]).pack(fill="x", padx=24, pady=10)
     tk.Button(win, text="View on GitHub", bg=NAVBAR_BG, fg=NAVBAR_FG,
               relief="flat", cursor="hand2", font=("Helvetica", 9),
-              command=lambda: webbrowser.open(GITHUB_URL)).pack(pady=(0, 18), ipadx=14, ipady=5)
+              command=lambda: webbrowser.open(GITHUB_URL)
+              ).pack(pady=(0, 18), ipadx=14, ipady=5)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main application
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ProbeFlowGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("ProbeFlow")
-        self.root.minsize(860, 600)
+        self.root.minsize(900, 620)
         self.root.resizable(True, True)
 
         self.cfg = load_config()
         self.log_queue: queue.Queue = queue.Queue()
-        self._running = False
-        self._adv_visible = False
-        self._theme_widgets: list = []
+        self._running   = False
+        self._adv_vis   = False
+        self._mode      = "convert"   # "convert" | "browse"
 
         self.dark_mode  = tk.BooleanVar(value=self.cfg["dark_mode"])
         self.input_dir  = tk.StringVar(value=self.cfg["input_dir"])
@@ -154,17 +371,16 @@ class ProbeFlowGUI:
         self.do_sxm     = tk.BooleanVar(value=self.cfg["do_sxm"])
         self.clip_low   = tk.DoubleVar(value=self.cfg["clip_low"])
         self.clip_high  = tk.DoubleVar(value=self.cfg["clip_high"])
-        self._status_text = tk.StringVar(value="Ready")
-        self._file_count  = tk.StringVar(value="No files selected")
+        self._status    = tk.StringVar(value="Ready")
 
         self._build_ui()
         self._apply_theme()
         self._poll_log()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
+    # Build
+    # ──────────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
         self._build_navbar()
@@ -175,12 +391,11 @@ class ProbeFlowGUI:
         nav = tk.Frame(self.root, bg=NAVBAR_BG, height=NAVBAR_H)
         nav.pack(fill="x")
         nav.pack_propagate(False)
+        self._nav = nav
 
-        # Logo in top-left corner
         try:
             img = Image.open(LOGO_PATH).convert("RGBA")
             img.thumbnail((120, 44), Image.LANCZOS)
-            # make white pixels transparent so logo blends into navbar
             data = img.getdata()
             img.putdata([(r, g, b, 0) if r > 220 and g > 220 and b > 220 else (r, g, b, a)
                          for r, g, b, a in data])
@@ -191,34 +406,28 @@ class ProbeFlowGUI:
         except Exception:
             pass
 
-        title_frame = tk.Frame(nav, bg=NAVBAR_BG)
-        title_frame.pack(side="left", padx=(6, 0))
-        tk.Label(title_frame, text="ProbeFlow", font=("Helvetica", 14, "bold"),
+        tf = tk.Frame(nav, bg=NAVBAR_BG)
+        tf.pack(side="left", padx=(6, 0))
+        tk.Label(tf, text="ProbeFlow", font=("Helvetica", 14, "bold"),
                  bg=NAVBAR_BG, fg=NAVBAR_FG).pack(anchor="w")
-        tk.Label(title_frame, text="Createc -> Nanonis", font=("Helvetica", 8),
+        tk.Label(tf, text="Createc -> Nanonis", font=("Helvetica", 8),
                  bg=NAVBAR_BG, fg="#a8c8f0").pack(anchor="w")
 
-        # Right-side nav buttons
-        tk.Button(nav, text="About",
-                  bg=NAVBAR_BG, fg=NAVBAR_FG, relief="flat", cursor="hand2",
-                  font=("Helvetica", 9), bd=0, padx=10,
-                  activebackground="#2563c0", activeforeground=NAVBAR_FG,
-                  command=lambda: _show_about(self.root, self.dark_mode.get())
-                  ).pack(side="right", pady=14)
+        def _navbtn(text, cmd):
+            return tk.Button(nav, text=text, bg=NAVBAR_BG, fg=NAVBAR_FG,
+                             relief="flat", cursor="hand2", font=("Helvetica", 9),
+                             bd=0, padx=10, activebackground="#2563c0",
+                             activeforeground=NAVBAR_FG, command=cmd)
 
-        tk.Button(nav, text="GitHub",
-                  bg=NAVBAR_BG, fg=NAVBAR_FG, relief="flat", cursor="hand2",
-                  font=("Helvetica", 9), bd=0, padx=10,
-                  activebackground="#2563c0", activeforeground=NAVBAR_FG,
-                  command=lambda: webbrowser.open(GITHUB_URL)
-                  ).pack(side="right", pady=14)
+        _navbtn("About",  lambda: _show_about(self.root, self.dark_mode.get())).pack(side="right", pady=14)
+        _navbtn("GitHub", lambda: webbrowser.open(GITHUB_URL)).pack(side="right", pady=14)
 
-        self._theme_btn = tk.Button(
-            nav, text="Light mode" if self.dark_mode.get() else "Dark mode",
-            bg=NAVBAR_BG, fg=NAVBAR_FG, relief="flat", cursor="hand2",
-            font=("Helvetica", 9), bd=0, padx=10,
-            activebackground="#2563c0", activeforeground=NAVBAR_FG,
-            command=self._toggle_theme,
+        self._open_btn = _navbtn("Open folder", self._open_browse_folder)
+        self._open_btn.pack(side="right", pady=14)
+
+        self._theme_btn = _navbtn(
+            "Light mode" if self.dark_mode.get() else "Dark mode",
+            self._toggle_theme,
         )
         self._theme_btn.pack(side="right", pady=14)
 
@@ -227,246 +436,435 @@ class ProbeFlowGUI:
         body.pack(fill="both", expand=True)
         self._body = body
 
-        # Left: main content panel (~70%)
-        self._main = tk.Frame(body)
-        self._main.pack(side="left", fill="both", expand=True)
+        # Left: content area with mode tabs
+        left = tk.Frame(body)
+        left.pack(side="left", fill="both", expand=True)
+        self._left = left
 
-        # Right: sidebar (~280px)
+        # Tab bar
+        tabbar = tk.Frame(left)
+        tabbar.pack(fill="x")
+        self._tabbar = tabbar
+        self._tab_convert = tk.Button(tabbar, text="Convert",
+                                      font=("Helvetica", 9, "bold"),
+                                      relief="flat", cursor="hand2", bd=0, padx=16, pady=6,
+                                      command=lambda: self._switch_mode("convert"))
+        self._tab_convert.pack(side="left")
+        self._tab_browse = tk.Button(tabbar, text="Browse",
+                                     font=("Helvetica", 9, "bold"),
+                                     relief="flat", cursor="hand2", bd=0, padx=16, pady=6,
+                                     command=lambda: self._switch_mode("browse"))
+        self._tab_browse.pack(side="left")
+
+        # Convert panel
+        self._conv_frame = tk.Frame(left)
+        self._build_convert_panel(self._conv_frame)
+
+        # Browse panel
+        self._browse_frame = tk.Frame(left)
+        self._grid = ThumbnailGrid(
+            self._browse_frame, self._on_group_select,
+            THEMES["dark" if self.dark_mode.get() else "light"],
+        )
+        self._grid.pack(fill="both", expand=True)
+
+        # Show convert by default
+        self._conv_frame.pack(fill="both", expand=True)
+
+        # Right sidebar (290px)
         self._sidebar = tk.Frame(body, width=290)
         self._sidebar.pack(side="right", fill="y")
         self._sidebar.pack_propagate(False)
 
-        self._build_main_panel()
-        self._build_sidebar()
+        self._conv_sidebar = tk.Frame(self._sidebar)
+        self._build_convert_sidebar(self._conv_sidebar)
 
-    def _build_main_panel(self) -> None:
-        p = self._main
-        pad = {"padx": 16, "pady": 6}
+        self._browse_sidebar = tk.Frame(self._sidebar)
+        self._build_browse_sidebar(self._browse_sidebar)
 
-        # Section: Folders
-        self._section_label(p, "Folders")
+        self._conv_sidebar.pack(fill="both", expand=True)
+
+    def _build_convert_panel(self, p: tk.Frame) -> None:
         self._folder_row(p, "Input folder:",  self.input_dir,  self._browse_input)
         self._folder_row(p, "Output folder:", self.output_dir, self._browse_output)
-
         self._hsep(p)
 
-        # Section: Log
         log_hdr = tk.Frame(p)
-        log_hdr.pack(fill="x", **pad)
-        self._section_label(log_hdr, "Conversion log", inline=True)
+        log_hdr.pack(fill="x", padx=16, pady=(2, 0))
+        tk.Label(log_hdr, text="Conversion log", font=("Helvetica", 9, "bold"),
+                 anchor="w").pack(side="left")
         tk.Button(log_hdr, text="Clear", relief="flat", cursor="hand2",
-                  font=("Helvetica", 8), command=self._clear_log
-                  ).pack(side="right")
+                  font=("Helvetica", 8), command=self._clear_log).pack(side="right")
 
-        self.log_text = tk.Text(p, height=16, wrap="word",
-                                relief="flat", bd=0, font=("Courier", 9),
-                                state="disabled")
+        self.log_text = tk.Text(p, height=14, wrap="word", relief="flat", bd=0,
+                                font=("Courier", 9), state="disabled")
         self.log_text.pack(fill="both", expand=True, padx=16, pady=(2, 8))
 
-    def _build_sidebar(self) -> None:
-        s = self._sidebar
-
-        self._section_label(s, "Convert to", padx=12)
-        cb_frame = tk.Frame(s)
-        cb_frame.pack(fill="x", padx=16, pady=4)
-        self.png_cb = tk.Checkbutton(cb_frame, text="PNG preview", variable=self.do_png)
+    def _build_convert_sidebar(self, s: tk.Frame) -> None:
+        self._sec(s, "Convert to")
+        cbf = tk.Frame(s)
+        cbf.pack(fill="x", padx=16, pady=4)
+        self.png_cb = tk.Checkbutton(cbf, text="PNG preview",   variable=self.do_png)
+        self.sxm_cb = tk.Checkbutton(cbf, text="SXM (Nanonis)", variable=self.do_sxm)
         self.png_cb.pack(anchor="w", pady=2)
-        self.sxm_cb = tk.Checkbutton(cb_frame, text="SXM (Nanonis)", variable=self.do_sxm)
         self.sxm_cb.pack(anchor="w", pady=2)
-
         self._hsep(s)
 
-        # Advanced options (collapsible)
         adv_hdr = tk.Frame(s)
         adv_hdr.pack(fill="x", padx=12, pady=(2, 0))
-        self._adv_btn = tk.Button(adv_hdr, text="[+] Advanced options",
-                                  relief="flat", bd=0, cursor="hand2", anchor="w",
-                                  font=("Helvetica", 9),
-                                  command=self._toggle_advanced)
+        self._adv_btn = tk.Button(adv_hdr, text="[+] Advanced",
+                                  relief="flat", bd=0, cursor="hand2",
+                                  font=("Helvetica", 9), anchor="w",
+                                  command=self._toggle_adv)
         self._adv_btn.pack(side="left")
 
         self._adv_frame = tk.Frame(s)
-        self._slider_row(self._adv_frame, "Clip low (%):",  self.clip_low,   0.0,  10.0)
+        self._slider_row(self._adv_frame, "Clip low (%):",  self.clip_low,  0.0,  10.0)
         self._slider_row(self._adv_frame, "Clip high (%):", self.clip_high, 90.0, 100.0)
-
         self._hsep(s)
 
-        # RUN button
-        run_frame = tk.Frame(s)
-        run_frame.pack(fill="x", padx=16, pady=10)
-        self.run_btn = tk.Button(run_frame, text="  RUN  ",
+        rf = tk.Frame(s)
+        rf.pack(fill="x", padx=16, pady=10)
+        self.run_btn = tk.Button(rf, text="  RUN  ",
                                  font=("Helvetica", 12, "bold"),
-                                 relief="flat", cursor="hand2",
-                                 command=self._run)
+                                 relief="flat", cursor="hand2", command=self._run)
         self.run_btn.pack(fill="x", ipady=8)
-
         self._hsep(s)
 
-        # Info section
-        info_frame = tk.Frame(s)
-        info_frame.pack(fill="x", padx=12, pady=4)
-        self._file_count_lbl = tk.Label(info_frame, textvariable=self._file_count,
-                                        font=("Helvetica", 8), anchor="w",
-                                        wraplength=250, justify="left")
-        self._file_count_lbl.pack(anchor="w")
+        # File count label
+        self._fcount_var = tk.StringVar(value="No folder selected")
+        self._fcount_lbl = tk.Label(s, textvariable=self._fcount_var,
+                                    font=("Helvetica", 8), anchor="w",
+                                    wraplength=250, justify="left")
+        self._fcount_lbl.pack(fill="x", padx=14, pady=4)
 
-        # Footer attribution (bottom of sidebar)
-        footer = tk.Frame(s)
-        footer.pack(side="bottom", fill="x", padx=12, pady=8)
-        self._footer_lbl = tk.Label(
-            footer,
+        self.input_dir.trace_add("write", lambda *_: self._update_count())
+
+        self._conv_footer = tk.Label(
+            s,
             text="SPMQT-Lab  |  Dr. Peter Jacobson\nThe University of Queensland\nOriginal code by Rohan Platts",
             font=("Helvetica", 7), anchor="center", justify="center",
         )
-        self._footer_lbl.pack()
+        self._conv_footer.pack(side="bottom", pady=8)
 
-    # ------------------------------------------------------------------
-    # Widget helpers
-    # ------------------------------------------------------------------
+    def _build_browse_sidebar(self, s: tk.Frame) -> None:
+        self._sec(s, "Selected scan")
 
-    def _section_label(self, parent, text: str, padx: int = 16, inline: bool = False) -> None:
-        kwargs = {"padx": padx, "pady": (10, 2)}
-        lbl = tk.Label(parent, text=text, font=("Helvetica", 9, "bold"), anchor="w")
-        if inline:
-            lbl.pack(side="left")
+        # Channel thumbnails (2x2 grid of small images)
+        self._ch_frame = tk.Frame(s)
+        self._ch_frame.pack(fill="x", padx=8, pady=4)
+        self._ch_labels: List[tk.Label] = []
+        self._ch_photos: List[Optional[ImageTk.PhotoImage]] = []
+        for row in range(2):
+            for col in range(2):
+                lbl = tk.Label(self._ch_frame, relief="flat", bd=1)
+                lbl.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
+                self._ch_labels.append(lbl)
+                self._ch_photos.append(None)
+        self._ch_frame.grid_columnconfigure(0, weight=1)
+        self._ch_frame.grid_columnconfigure(1, weight=1)
+
+        self._ch_name_lbl = tk.Label(s, text="", font=("Helvetica", 8, "bold"),
+                                     anchor="w", wraplength=250)
+        self._ch_name_lbl.pack(fill="x", padx=14, pady=(0, 4))
+
+        self._hsep(s)
+        self._sec(s, "Metadata")
+
+        # Scrollable metadata text
+        meta_frame = tk.Frame(s)
+        meta_frame.pack(fill="both", expand=True, padx=8, pady=4)
+        meta_vsb = tk.Scrollbar(meta_frame, orient="vertical")
+        self._meta_text = tk.Text(meta_frame, wrap="word", relief="flat", bd=0,
+                                  font=("Courier", 8), state="disabled",
+                                  yscrollcommand=meta_vsb.set)
+        meta_vsb.configure(command=self._meta_text.yview)
+        self._meta_text.pack(side="left", fill="both", expand=True)
+        meta_vsb.pack(side="right", fill="y")
+
+        # Key metadata fields to show (in order)
+        self._META_KEYS = [
+            ("Date",       ["REC_DATE", "REC_TIME"]),
+            ("Pixels",     ["SCAN_PIXELS"]),
+            ("Size (m)",   ["SCAN_RANGE"]),
+            ("Offset (m)", ["SCAN_OFFSET"]),
+            ("Bias (V)",   ["BIAS"]),
+            ("Scan dir",   ["SCAN_DIR"]),
+            ("Angle",      ["SCAN_ANGLE"]),
+            ("Temp (K)",   ["REC_TEMP"]),
+            ("Comment",    ["COMMENT"]),
+            ("Clip low",   ["Clip_percentile_Lower"]),
+            ("Clip high",  ["Clip_percentile_Higher"]),
+        ]
+
+    def _build_statusbar(self) -> None:
+        bar = tk.Frame(self.root, height=28)
+        bar.pack(fill="x", side="bottom")
+        bar.pack_propagate(False)
+        self._statusbar = bar
+        self._status_lbl = tk.Label(bar, textvariable=self._status,
+                                    font=("Helvetica", 8), anchor="w")
+        self._status_lbl.pack(side="left", padx=12)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Mode switching
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _switch_mode(self, mode: str) -> None:
+        if mode == self._mode:
+            return
+        self._mode = mode
+        t = THEMES["dark" if self.dark_mode.get() else "light"]
+
+        if mode == "convert":
+            self._browse_frame.pack_forget()
+            self._conv_frame.pack(fill="both", expand=True)
+            self._browse_sidebar.pack_forget()
+            self._conv_sidebar.pack(fill="both", expand=True)
+            self._status.set("Ready")
         else:
-            lbl.pack(fill="x", **kwargs)
+            self._conv_frame.pack_forget()
+            self._browse_frame.pack(fill="both", expand=True)
+            self._conv_sidebar.pack_forget()
+            self._browse_sidebar.pack(fill="both", expand=True)
+            self._repaint(self._browse_sidebar, t, "sidebar")
+            n = len(self._grid._groups)
+            self._status.set(f"{n} scan(s) loaded" if n else "Open a folder to browse")
+
+        self._update_tabs()
+        self._apply_theme()
+
+    def _update_tabs(self) -> None:
+        t = THEMES["dark" if self.dark_mode.get() else "light"]
+        for btn, name in ((self._tab_convert, "convert"), (self._tab_browse, "browse")):
+            active = (self._mode == name)
+            btn.configure(
+                bg=t["tab_act"] if active else t["tab_inact"],
+                fg=t["fg"],
+                relief="flat",
+            )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Browse callbacks
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _open_browse_folder(self) -> None:
+        d = filedialog.askdirectory(title="Open output folder to browse")
+        if not d:
+            return
+        self._switch_mode("browse")
+        groups = scan_output_folder(Path(d))
+        self._grid.load(groups)
+        n = len(groups)
+        self._status.set(f"{n} scan(s) loaded from {d}")
+        self._clear_browse_sidebar()
+
+    def _on_group_select(self, g: DatGroup) -> None:
+        self._ch_name_lbl.configure(text=g.stem)
+        self._load_channel_thumbnails(g.pngs)
+        self._load_metadata(g.sxm)
+        self._status.set(f"Selected: {g.stem}  |  {len(g.pngs)} channel(s)"
+                         + ("  |  SXM found" if g.sxm else "  |  no SXM"))
+
+    def _load_channel_thumbnails(self, pngs: List[Path]) -> None:
+        t = THEMES["dark" if self.dark_mode.get() else "light"]
+        # Show up to 4 channels in 2x2 grid
+        ordered = sorted(pngs)
+        # Z forward first, then Z backward, Current forward, Current backward
+        def _key(p):
+            n = p.name
+            return (0 if "Z" in n and "forward" in n else
+                    1 if "Z" in n and "backward" in n else
+                    2 if "Current" in n and "forward" in n else 3)
+        ordered = sorted(pngs, key=_key)[:4]
+
+        for i in range(4):
+            if i < len(ordered) and ordered[i].exists():
+                try:
+                    img = Image.open(ordered[i]).convert("RGB")
+                    img.thumbnail((110, 90), Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    self._ch_photos[i] = photo
+                    self._ch_labels[i].configure(image=photo, bg=t["sidebar_bg"],
+                                                 text="", compound="none")
+                except Exception:
+                    self._ch_labels[i].configure(image="", text="err",
+                                                 bg=t["sidebar_bg"], fg=t["sub_fg"])
+            else:
+                self._ch_photos[i] = None
+                self._ch_labels[i].configure(image="", text="",
+                                             bg=t["sidebar_bg"])
+
+    def _load_metadata(self, sxm: Optional[Path]) -> None:
+        self._meta_text.configure(state="normal")
+        self._meta_text.delete("1.0", "end")
+
+        if sxm and sxm.exists():
+            hdr = parse_sxm_header(sxm)
+            lines = []
+            for label, keys in self._META_KEYS:
+                vals = [hdr.get(k, "").strip() for k in keys if hdr.get(k, "").strip()]
+                if vals:
+                    v = "  ".join(vals)
+                    lines.append(f"{label:<12}  {v}")
+            self._meta_text.insert("end", "\n".join(lines))
+        else:
+            self._meta_text.insert("end", "(no SXM file found)")
+
+        self._meta_text.configure(state="disabled")
+
+    def _clear_browse_sidebar(self) -> None:
+        self._ch_name_lbl.configure(text="")
+        t = THEMES["dark" if self.dark_mode.get() else "light"]
+        for i, lbl in enumerate(self._ch_labels):
+            self._ch_photos[i] = None
+            lbl.configure(image="", text="", bg=t["sidebar_bg"])
+        self._meta_text.configure(state="normal")
+        self._meta_text.delete("1.0", "end")
+        self._meta_text.configure(state="disabled")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Widget helpers
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _sec(self, parent, text: str) -> None:
+        tk.Label(parent, text=text, font=("Helvetica", 9, "bold"), anchor="w"
+                 ).pack(fill="x", padx=14, pady=(10, 2))
 
     def _hsep(self, parent) -> None:
-        sep = tk.Frame(parent, height=1)
-        sep.pack(fill="x", padx=12, pady=6)
-        self._theme_widgets.append((sep, "sep"))
+        tk.Frame(parent, height=1).pack(fill="x", padx=10, pady=5)
 
     def _folder_row(self, parent, label: str, var: tk.StringVar, cmd) -> None:
         f = tk.Frame(parent)
         f.pack(fill="x", padx=16, pady=4)
         tk.Label(f, text=label, width=13, anchor="w").pack(side="left")
-        e = tk.Entry(f, textvariable=var, relief="flat", bd=2)
-        e.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        b = tk.Button(f, text="Browse", relief="flat", cursor="hand2", command=cmd,
-                      font=("Helvetica", 8))
-        b.pack(side="right")
-        self._theme_widgets.extend([(e, "entry"), (b, "btn"), (f, "frame")])
-        var.trace_add("write", lambda *_: self._update_file_count())
+        tk.Entry(f, textvariable=var, relief="flat", bd=2).pack(
+            side="left", fill="x", expand=True, padx=(0, 6))
+        tk.Button(f, text="Browse", relief="flat", cursor="hand2",
+                  font=("Helvetica", 8), command=cmd).pack(side="right")
 
     def _slider_row(self, parent, label: str, var: tk.DoubleVar,
                     from_: float, to: float) -> None:
         f = tk.Frame(parent)
         f.pack(fill="x", padx=16, pady=4)
         tk.Label(f, text=label, width=13, anchor="w").pack(side="left")
-        s = tk.Scale(f, variable=var, from_=from_, to=to, resolution=0.5,
-                     orient="horizontal", length=180, sliderlength=14,
-                     relief="flat", bd=0, highlightthickness=0)
-        s.pack(side="left")
-        self._theme_widgets.append((s, "slider"))
+        tk.Scale(f, variable=var, from_=from_, to=to, resolution=0.5,
+                 orient="horizontal", length=170, sliderlength=14,
+                 relief="flat", bd=0, highlightthickness=0).pack(side="left")
 
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
     # Theme
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
 
     def _apply_theme(self) -> None:
         t = THEMES["dark" if self.dark_mode.get() else "light"]
-        self.root.configure(bg=t["bg"])
 
-        for frame in (self._body, self._main, self._sidebar, self._adv_frame):
-            frame.configure(bg=t["main_bg"] if frame is self._main else
-                            t["sidebar_bg"] if frame is self._sidebar else t["bg"])
+        for w in (self.root, self._body, self._left, self._tabbar,
+                  self._conv_frame, self._browse_frame):
+            try:
+                w.configure(bg=t["main_bg"])
+            except Exception:
+                pass
 
-        self._repaint(self._main,    t, main=True)
-        self._repaint(self._sidebar, t, sidebar=True)
+        for w in (self._sidebar, self._conv_sidebar, self._browse_sidebar,
+                  self._adv_frame, self._ch_frame):
+            try:
+                w.configure(bg=t["sidebar_bg"])
+            except Exception:
+                pass
+
+        self._repaint(self._conv_frame,    t, "main")
+        self._repaint(self._conv_sidebar,  t, "sidebar")
+        self._repaint(self._browse_sidebar, t, "sidebar")
+        self._repaint(self._tabbar,         t, "main")
 
         self.log_text.configure(bg=t["log_bg"], fg=t["log_fg"], insertbackground=t["fg"])
-        self.log_text.tag_config("ok",   foreground=t["ok_fg"])
-        self.log_text.tag_config("err",  foreground=t["err_fg"])
-        self.log_text.tag_config("warn", foreground=t["warn_fg"])
-        self.log_text.tag_config("info", foreground=t["log_fg"])
+        for tag, col in (("ok", t["ok_fg"]), ("err", t["err_fg"]),
+                         ("warn", t["warn_fg"]), ("info", t["log_fg"])):
+            self.log_text.tag_config(tag, foreground=col)
+
+        self._meta_text.configure(bg=t["sidebar_bg"], fg=t["fg"],
+                                  insertbackground=t["fg"])
 
         self.run_btn.configure(bg=t["accent_bg"], fg=t["accent_fg"],
-                               activebackground=t["accent_bg"], activeforeground=t["accent_fg"])
+                               activebackground=t["accent_bg"],
+                               activeforeground=t["accent_fg"])
 
-        self._status_bar.configure(bg=t["status_bg"])
+        self._statusbar.configure(bg=t["status_bg"])
         self._status_lbl.configure(bg=t["status_bg"], fg=t["status_fg"])
 
-        self._footer_lbl.configure(bg=t["sidebar_bg"], fg=t["sub_fg"])
-        self._file_count_lbl.configure(bg=t["sidebar_bg"], fg=t["sub_fg"])
+        self._conv_footer.configure(bg=t["sidebar_bg"], fg=t["sub_fg"])
+        self._fcount_lbl.configure(bg=t["sidebar_bg"], fg=t["sub_fg"])
+        self._ch_name_lbl.configure(bg=t["sidebar_bg"], fg=t["fg"])
 
-    def _repaint(self, widget, t: dict, main: bool = False, sidebar: bool = False) -> None:
-        panel_bg = t["main_bg"] if main else (t["sidebar_bg"] if sidebar else t["bg"])
+        self._grid.apply_theme(t)
+        self._update_tabs()
+
+    def _repaint(self, widget, t: dict, zone: str = "main") -> None:
+        bg = t["main_bg"] if zone == "main" else t["sidebar_bg"]
         cls = widget.winfo_class()
         try:
             if cls == "Frame":
-                widget.configure(bg=panel_bg)
+                widget.configure(bg=bg)
             elif cls == "Label":
-                widget.configure(bg=panel_bg, fg=t["fg"])
+                widget.configure(bg=bg, fg=t["fg"])
             elif cls == "Button":
                 widget.configure(bg=t["btn_bg"], fg=t["btn_fg"],
-                                 activebackground=panel_bg, activeforeground=t["fg"],
+                                 activebackground=bg, activeforeground=t["fg"],
                                  relief="flat")
             elif cls == "Checkbutton":
-                widget.configure(bg=panel_bg, fg=t["fg"], selectcolor=t["entry_bg"],
-                                 activebackground=panel_bg, activeforeground=t["fg"])
+                widget.configure(bg=bg, fg=t["fg"], selectcolor=t["entry_bg"],
+                                 activebackground=bg, activeforeground=t["fg"])
             elif cls == "Entry":
                 widget.configure(bg=t["entry_bg"], fg=t["fg"],
                                  insertbackground=t["fg"], relief="flat")
             elif cls == "Scale":
-                widget.configure(bg=panel_bg, fg=t["fg"],
-                                 troughcolor=t["entry_bg"], activebackground=t["accent_bg"])
+                widget.configure(bg=bg, fg=t["fg"],
+                                 troughcolor=t["entry_bg"],
+                                 activebackground=t["accent_bg"])
         except tk.TclError:
             pass
         for child in widget.winfo_children():
-            self._repaint(child, t, main=main, sidebar=sidebar)
+            self._repaint(child, t, zone)
 
     def _toggle_theme(self) -> None:
         self.dark_mode.set(not self.dark_mode.get())
-        self._theme_btn.config(
+        self._theme_btn.configure(
             text="Light mode" if self.dark_mode.get() else "Dark mode")
         self._apply_theme()
 
-    # ------------------------------------------------------------------
-    # Status bar
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
+    # Advanced toggle
+    # ──────────────────────────────────────────────────────────────────────
 
-    def _build_statusbar(self) -> None:
-        bar = tk.Frame(self.root, height=28)
-        bar.pack(fill="x", side="bottom")
-        bar.pack_propagate(False)
-        self._status_bar = bar
-        self._status_lbl = tk.Label(bar, textvariable=self._status_text,
-                                    font=("Helvetica", 8), anchor="w")
-        self._status_lbl.pack(side="left", padx=12)
-
-    # ------------------------------------------------------------------
-    # Advanced options toggle
-    # ------------------------------------------------------------------
-
-    def _toggle_advanced(self) -> None:
-        if self._adv_visible:
+    def _toggle_adv(self) -> None:
+        if self._adv_vis:
             self._adv_frame.pack_forget()
-            self._adv_btn.config(text="[+] Advanced options")
+            self._adv_btn.configure(text="[+] Advanced")
         else:
             self._adv_frame.pack(fill="x")
             t = THEMES["dark" if self.dark_mode.get() else "light"]
-            self._repaint(self._adv_frame, t, sidebar=True)
-            self._adv_btn.config(text="[-] Advanced options")
-        self._adv_visible = not self._adv_visible
+            self._repaint(self._adv_frame, t, "sidebar")
+            self._adv_btn.configure(text="[-] Advanced")
+        self._adv_vis = not self._adv_vis
 
-    # ------------------------------------------------------------------
-    # File count helper
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
+    # File count
+    # ──────────────────────────────────────────────────────────────────────
 
-    def _update_file_count(self) -> None:
+    def _update_count(self) -> None:
         d = self.input_dir.get().strip()
         if d and Path(d).is_dir():
             n = len(list(Path(d).glob("*.dat")))
-            self._file_count.set(f"{n} .dat file(s) in input folder")
-            self._status_text.set(f"{n} .dat file(s) found")
+            self._fcount_var.set(f"{n} .dat file(s) in input folder")
+            self._status.set(f"{n} .dat file(s) found")
         else:
-            self._file_count.set("No files selected")
-            self._status_text.set("Ready")
+            self._fcount_var.set("No folder selected")
+            self._status.set("Ready")
 
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
     # Folder pickers
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
 
     def _browse_input(self) -> None:
         d = filedialog.askdirectory(title="Select input folder containing .dat files")
@@ -478,9 +876,9 @@ class ProbeFlowGUI:
         if d:
             self.output_dir.set(d)
 
-    # ------------------------------------------------------------------
-    # Log helpers
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
+    # Log
+    # ──────────────────────────────────────────────────────────────────────
 
     def _log(self, msg: str, tag: str = "info") -> None:
         self.log_text.configure(state="normal")
@@ -496,19 +894,19 @@ class ProbeFlowGUI:
     def _poll_log(self) -> None:
         try:
             while True:
-                record = self.log_queue.get_nowait()
-                msg = record.getMessage()
-                tag = ("err" if record.levelno >= logging.ERROR else
-                       "warn" if record.levelno == logging.WARNING else
-                       "ok" if "[OK]" in msg else "info")
+                rec = self.log_queue.get_nowait()
+                msg = rec.getMessage()
+                tag = ("err"  if rec.levelno >= logging.ERROR  else
+                       "warn" if rec.levelno == logging.WARNING else
+                       "ok"   if "[OK]" in msg else "info")
                 self._log(msg, tag)
         except queue.Empty:
             pass
         self.root.after(80, self._poll_log)
 
-    # ------------------------------------------------------------------
-    # Run conversion
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
+    # Conversion
+    # ──────────────────────────────────────────────────────────────────────
 
     def _run(self) -> None:
         if self._running:
@@ -526,11 +924,13 @@ class ProbeFlowGUI:
 
         self._running = True
         self.run_btn.configure(text="  Running...  ", state="disabled")
-        self._status_text.set("Converting...")
+        self._status.set("Converting...")
         self._clear_log()
         handler = QueueHandler(self.log_queue)
         handler.setLevel(logging.DEBUG)
-        threading.Thread(target=self._worker, args=(in_dir, out_dir, handler), daemon=True).start()
+        threading.Thread(
+            target=self._worker, args=(in_dir, out_dir, handler), daemon=True
+        ).start()
 
     def _worker(self, in_dir: str, out_dir: str, handler: QueueHandler) -> None:
         logger = logging.getLogger("nanonis_tools")
@@ -561,7 +961,8 @@ class ProbeFlowGUI:
                     for i, dat in enumerate(files, 1):
                         logger.info("[%d/%d] %s ...", i, len(files), dat.name)
                         try:
-                            convert_dat_to_sxm(dat, sxm_out, DEFAULT_CUSHION, clip_low, clip_high)
+                            convert_dat_to_sxm(dat, sxm_out, DEFAULT_CUSHION,
+                                               clip_low, clip_high)
                         except Exception as exc:
                             logger.error("FAILED %s: %s", dat.name, exc)
                             errors[dat.name] = str(exc)
@@ -576,12 +977,22 @@ class ProbeFlowGUI:
             logger.error("Unexpected error: %s", exc)
         finally:
             logger.removeHandler(handler)
-            self.root.after(0, self._done)
+            self.root.after(0, lambda: self._done(out_dir))
 
-    def _done(self) -> None:
+    def _done(self, out_dir: str) -> None:
         self._running = False
         self.run_btn.configure(text="  RUN  ", state="normal")
-        self._status_text.set("Done")
+        self._status.set("Done")
+        # Auto-load browse view with the output folder
+        groups = scan_output_folder(Path(out_dir))
+        if groups:
+            self._grid.load(groups)
+            self._switch_mode("browse")
+            self._status.set(f"Done -- {len(groups)} scan(s) ready to browse")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Close
+    # ──────────────────────────────────────────────────────────────────────
 
     def _on_close(self) -> None:
         save_config({
