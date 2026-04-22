@@ -11,11 +11,16 @@ from typing import List, Optional
 import numpy as np
 from PIL import Image
 
+import matplotlib
+matplotlib.use("QtAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+
 from PySide6.QtCore import (
     Qt, QObject, QRunnable, QThreadPool, QTimer, QSize, Signal, Slot,
 )
 from PySide6.QtGui import (
-    QColor, QCursor, QFont, QImage, QMovie, QPixmap,
+    QColor, QCursor, QFont, QImage, QMovie, QPixmap, QWheelEvent,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
@@ -261,6 +266,7 @@ def render_sxm_plane(
 
         arr = np.frombuffer(raw[start: start + plane_bytes], dtype=">f4").copy()
         arr = arr.reshape((Ny, Nx))
+        arr = _orient_plane(arr, hdr, plane_idx)
 
         finite = arr[np.isfinite(arr)]
         if finite.size == 0:
@@ -283,7 +289,7 @@ def render_sxm_plane(
 
 
 def read_sxm_plane_raw(sxm_path: Path, plane_idx: int = 0) -> Optional[np.ndarray]:
-    """Read raw float32 array for a plane from an SXM file, returns None on error."""
+    """Read orientation-corrected float64 array for a plane from an SXM file."""
     try:
         hdr    = parse_sxm_header(sxm_path)
         Nx, Ny = _sxm_dims(hdr)
@@ -299,7 +305,9 @@ def read_sxm_plane_raw(sxm_path: Path, plane_idx: int = 0) -> Optional[np.ndarra
             return None
 
         arr = np.frombuffer(raw[start: start + plane_bytes], dtype=">f4").copy()
-        return arr.reshape((Ny, Nx))
+        arr = arr.reshape((Ny, Nx))
+        arr = _orient_plane(arr, hdr, plane_idx)
+        return arr.astype(np.float64)
     except Exception:
         return None
 
@@ -314,6 +322,26 @@ def _sxm_scan_range(hdr: dict) -> tuple[float, float]:
         except ValueError:
             pass
     return (0.0, 0.0)
+
+
+def _orient_plane(arr: np.ndarray, hdr: dict, plane_idx: int) -> np.ndarray:
+    """
+    Apply canonical display orientation for Nanonis SXM data.
+
+    Two corrections are needed:
+    1. SCAN_DIR='up': the tip scanned bottom-to-top, so row 0 in the file
+       is the bottom of the image.  Flip vertically so origin is top-left.
+    2. Backward scans (odd plane_idx: Z bwd=1, I bwd=3, …): the tip scanned
+       right-to-left, so the image is mirrored.  Flip horizontally to match
+       the forward-scan orientation.
+    """
+    scan_dir = hdr.get("SCAN_DIR", "down").strip().lower()
+    if scan_dir == "up":
+        arr = np.flipud(arr)
+    # Odd plane indices are backward (right-to-left) scans
+    if plane_idx % 2 == 1:
+        arr = np.fliplr(arr)
+    return arr
 
 
 def render_with_processing(
@@ -579,20 +607,35 @@ class ViewerSignals(QObject):
 
 class ViewerLoader(QRunnable):
     def __init__(self, entry: SxmFile, colormap: str, token, w: int, h: int,
-                 plane_idx: int = 0):
+                 plane_idx: int = 0, clip_low: float = 1.0,
+                 clip_high: float = 99.0, processing: dict = None):
         super().__init__()
         self.setAutoDelete(True)
-        self.signals   = ViewerSignals()
-        self.entry     = entry
-        self.colormap  = colormap
-        self.token     = token
-        self.w         = w
-        self.h         = h
-        self.plane_idx = plane_idx
+        self.signals    = ViewerSignals()
+        self.entry      = entry
+        self.colormap   = colormap
+        self.token      = token
+        self.w          = w
+        self.h          = h
+        self.plane_idx  = plane_idx
+        self.clip_low   = clip_low
+        self.clip_high  = clip_high
+        self.processing = processing or {}
 
     def run(self):
-        img = render_sxm_plane(self.entry.path, self.plane_idx, self.colormap,
-                                size=(self.w, self.h))
+        if self.processing:
+            arr = read_sxm_plane_raw(self.entry.path, self.plane_idx)
+            if arr is not None:
+                img = render_with_processing(arr, self.colormap,
+                                             self.clip_low, self.clip_high,
+                                             self.processing,
+                                             size=(self.w, self.h))
+            else:
+                img = None
+        else:
+            img = render_sxm_plane(self.entry.path, self.plane_idx,
+                                   self.colormap, self.clip_low, self.clip_high,
+                                   size=(self.w, self.h))
         if img is not None:
             self.signals.loaded.emit(pil_to_pixmap(img), self.token)
 
@@ -811,13 +854,17 @@ class ThumbnailGrid(QWidget):
         outer.addWidget(self._scroll, 1)
 
         # state
-        self._cards:         dict[str, ScanCard] = {}
-        self._entries:       list[SxmFile]       = []
-        self._selected:      set[str]            = set()
-        self._primary:       Optional[str]       = None  # last clicked
-        self._card_colormaps: dict[str, str]     = {}    # per-card colormap
-        self._load_token                         = object()
-        self._current_cols: int                  = 1
+        self._cards:          dict[str, ScanCard]              = {}
+        self._entries:        list[SxmFile]                    = []
+        self._selected:       set[str]                         = set()
+        self._primary:        Optional[str]                    = None
+        self._card_colormaps: dict[str, str]                   = {}
+        self._card_processing: dict[str, dict]                 = {}   # current processing per stem
+        self._card_clip:      dict[str, tuple[float, float]]   = {}   # current clip per stem
+        # per-stem undo stack: list of (colormap, clip_low, clip_high, processing)
+        self._history:        dict[str, list[tuple]]           = {}
+        self._load_token                                       = object()
+        self._current_cols: int                                = 1
 
         # empty-state placeholder
         self._empty_lbl = QLabel("Open a folder to browse SXM scans")
@@ -882,7 +929,16 @@ class ThumbnailGrid(QWidget):
             entry = next((e for e in self._entries if e.stem == stem), None)
             card  = self._cards.get(stem)
             if entry and card:
-                self._card_colormaps[stem] = colormap_key
+                # push current state onto undo history
+                prev_cmap = self._card_colormaps.get(stem, DEFAULT_CMAP_KEY)
+                prev_clip = self._card_clip.get(stem, (1.0, 99.0))
+                prev_proc = self._card_processing.get(stem, {})
+                self._history.setdefault(stem, []).append(
+                    (prev_cmap, prev_clip[0], prev_clip[1], dict(prev_proc)))
+                # apply new state
+                self._card_colormaps[stem]  = colormap_key
+                self._card_clip[stem]       = (clip_low, clip_high)
+                self._card_processing[stem] = dict(processing) if processing else {}
                 loader = ThumbnailLoader(entry, colormap_key, token,
                                          ScanCard.IMG_W, ScanCard.IMG_H,
                                          clip_low, clip_high,
@@ -890,6 +946,30 @@ class ThumbnailGrid(QWidget):
                 loader.signals.loaded.connect(self._on_thumb)
                 self._pool.start(loader)
         return len(self._selected)
+
+    def undo_last(self, stems: set[str]) -> int:
+        """Revert the last applied colormap/clip/processing for the given stems."""
+        count = 0
+        token = self._load_token
+        for stem in stems:
+            stack = self._history.get(stem)
+            if not stack:
+                continue
+            prev_cmap, prev_low, prev_high, prev_proc = stack.pop()
+            entry = next((e for e in self._entries if e.stem == stem), None)
+            card  = self._cards.get(stem)
+            if entry and card:
+                self._card_colormaps[stem]  = prev_cmap
+                self._card_clip[stem]       = (prev_low, prev_high)
+                self._card_processing[stem] = prev_proc
+                loader = ThumbnailLoader(entry, prev_cmap, token,
+                                         ScanCard.IMG_W, ScanCard.IMG_H,
+                                         prev_low, prev_high,
+                                         processing=prev_proc or None)
+                loader.signals.loaded.connect(self._on_thumb)
+                self._pool.start(loader)
+                count += 1
+        return count
 
     def get_entries(self) -> list[SxmFile]:
         return self._entries
@@ -977,68 +1057,297 @@ class ThumbnailGrid(QWidget):
 
 
 # ── Full-size image viewer dialog ─────────────────────────────────────────────
+class _ZoomLabel(QLabel):
+    """QLabel inside a scroll area that supports Ctrl+Wheel zoom."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self._pixmap_orig: Optional[QPixmap] = None
+        self._zoom = 1.0
+
+    def set_source(self, pixmap: QPixmap):
+        self._pixmap_orig = pixmap
+        self._apply_zoom()
+
+    def zoom_by(self, factor: float):
+        self._zoom = max(0.25, min(8.0, self._zoom * factor))
+        self._apply_zoom()
+
+    def reset_zoom(self):
+        self._zoom = 1.0
+        self._apply_zoom()
+
+    def _apply_zoom(self):
+        if self._pixmap_orig is None:
+            return
+        w = int(self._pixmap_orig.width()  * self._zoom)
+        h = int(self._pixmap_orig.height() * self._zoom)
+        scaled = self._pixmap_orig.scaled(w, h, Qt.KeepAspectRatio,
+                                           Qt.SmoothTransformation)
+        self.setPixmap(scaled)
+        self.resize(scaled.size())
+
+    def wheelEvent(self, event: QWheelEvent):
+        if event.modifiers() & Qt.ControlModifier:
+            delta = event.angleDelta().y()
+            self.zoom_by(1.12 if delta > 0 else 1 / 1.12)
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+
 class ImageViewerDialog(QDialog):
-    """Opens on double-click; shows full-size SXM plane with prev/next navigation."""
+    """Double-click viewer with scroll/zoom, histogram, clip sliders, processing, export."""
 
     def __init__(self, entry: SxmFile, entries: list[SxmFile],
-                 colormap: str, t: dict, parent=None):
+                 colormap: str, t: dict, parent=None,
+                 clip_low: float = 1.0, clip_high: float = 99.0,
+                 processing: dict = None):
         super().__init__(parent)
         self.setWindowTitle(entry.stem)
-        self.setMinimumSize(720, 620)
+        self.setMinimumSize(960, 680)
+        self.resize(1260, 800)
 
-        self._entries  = entries
-        self._colormap = colormap
-        self._t        = t
-        self._idx      = next((i for i, e in enumerate(entries) if e.stem == entry.stem), 0)
-        self._pool     = QThreadPool.globalInstance()
-        self._token    = object()
+        self._entries    = entries
+        self._colormap   = colormap
+        self._t          = t
+        self._idx        = next((i for i, e in enumerate(entries) if e.stem == entry.stem), 0)
+        self._pool       = QThreadPool.globalInstance()
+        self._token      = object()
+        self._clip_low   = clip_low
+        self._clip_high  = clip_high
+        self._processing = dict(processing) if processing else {}
+        self._raw_arr: Optional[np.ndarray] = None  # for histogram
 
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 12, 16, 16)
-        lay.setSpacing(10)
+        self._build()
+        self._load_current()
 
-        self._title_lbl = QLabel(entry.stem)
-        self._title_lbl.setFont(QFont("Helvetica", 13, QFont.Bold))
+    # ── Build ──────────────────────────────────────────────────────────────────
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        # title
+        self._title_lbl = QLabel()
+        self._title_lbl.setFont(QFont("Helvetica", 12, QFont.Bold))
         self._title_lbl.setAlignment(Qt.AlignCenter)
-        lay.addWidget(self._title_lbl)
+        root.addWidget(self._title_lbl)
 
-        ch_row = QHBoxLayout()
-        ch_lbl = QLabel("Channel:")
-        ch_lbl.setFont(QFont("Helvetica", 11))
+        # main splitter: image | right panel
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        # ── Left: scrollable zoom image ────────────────────────────────────────
+        left = QWidget()
+        left_lay = QVBoxLayout(left)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_lay.setSpacing(4)
+
+        self._scroll_area = QScrollArea()
+        self._scroll_area.setWidgetResizable(False)
+        self._scroll_area.setAlignment(Qt.AlignCenter)
+        self._zoom_lbl = _ZoomLabel()
+        self._zoom_lbl.setText("Loading…")
+        self._scroll_area.setWidget(self._zoom_lbl)
+        left_lay.addWidget(self._scroll_area, 1)
+
+        zoom_row = QHBoxLayout()
+        zoom_out_btn = QPushButton("−")
+        zoom_out_btn.setFixedSize(28, 24)
+        zoom_out_btn.setFont(QFont("Helvetica", 11))
+        zoom_out_btn.clicked.connect(lambda: self._zoom_lbl.zoom_by(1 / 1.25))
+        zoom_reset_btn = QPushButton("1:1")
+        zoom_reset_btn.setFixedSize(36, 24)
+        zoom_reset_btn.setFont(QFont("Helvetica", 9))
+        zoom_reset_btn.clicked.connect(self._zoom_lbl.reset_zoom)
+        zoom_in_btn = QPushButton("+")
+        zoom_in_btn.setFixedSize(28, 24)
+        zoom_in_btn.setFont(QFont("Helvetica", 11))
+        zoom_in_btn.clicked.connect(lambda: self._zoom_lbl.zoom_by(1.25))
+        zoom_hint = QLabel("Ctrl+scroll to zoom")
+        zoom_hint.setFont(QFont("Helvetica", 8))
+        zoom_row.addWidget(zoom_out_btn)
+        zoom_row.addWidget(zoom_reset_btn)
+        zoom_row.addWidget(zoom_in_btn)
+        zoom_row.addWidget(zoom_hint)
+        zoom_row.addStretch()
+        left_lay.addLayout(zoom_row)
+
+        splitter.addWidget(left)
+
+        # ── Right: control panel ───────────────────────────────────────────────
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        right_scroll.setFixedWidth(280)
+
+        right = QWidget()
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(8, 4, 8, 4)
+        right_lay.setSpacing(6)
+
+        # channel selector
+        ch_lbl = QLabel("Channel")
+        ch_lbl.setFont(QFont("Helvetica", 9, QFont.Bold))
+        right_lay.addWidget(ch_lbl)
         self._ch_cb = QComboBox()
         self._ch_cb.addItems(PLANE_NAMES)
-        self._ch_cb.setFont(QFont("Helvetica", 11))
-        self._ch_cb.setFixedWidth(140)
+        self._ch_cb.setFont(QFont("Helvetica", 9))
         self._ch_cb.currentIndexChanged.connect(self._on_channel_changed)
-        ch_row.addStretch()
-        ch_row.addWidget(ch_lbl)
-        ch_row.addWidget(self._ch_cb)
-        ch_row.addStretch()
-        lay.addLayout(ch_row)
+        right_lay.addWidget(self._ch_cb)
+        right_lay.addWidget(_sep())
 
-        self._img_lbl = QLabel("Loading…")
-        self._img_lbl.setAlignment(Qt.AlignCenter)
-        self._img_lbl.setMinimumSize(640, 500)
-        lay.addWidget(self._img_lbl, 1)
+        # histogram
+        hist_lbl = QLabel("Histogram")
+        hist_lbl.setFont(QFont("Helvetica", 9, QFont.Bold))
+        right_lay.addWidget(hist_lbl)
 
+        self._fig  = Figure(figsize=(2.6, 1.8), dpi=80)
+        self._fig.patch.set_alpha(0)
+        self._ax   = self._fig.add_subplot(111)
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._canvas.setFixedHeight(160)
+        right_lay.addWidget(self._canvas)
+        right_lay.addWidget(_sep())
+
+        # clip sliders
+        clip_lbl = QLabel("Clip Range")
+        clip_lbl.setFont(QFont("Helvetica", 9, QFont.Bold))
+        right_lay.addWidget(clip_lbl)
+
+        def _make_clip_row(label, init_val, mn, mx):
+            row = QHBoxLayout()
+            l = QLabel(label)
+            l.setFont(QFont("Helvetica", 8))
+            l.setFixedWidth(32)
+            sl = QSlider(Qt.Horizontal)
+            sl.setRange(mn, mx)
+            sl.setValue(int(init_val))
+            vl = QLabel(f"{int(init_val)}%")
+            vl.setFont(QFont("Helvetica", 8))
+            vl.setFixedWidth(32)
+            sl.valueChanged.connect(lambda v, vl=vl: vl.setText(f"{v}%"))
+            row.addWidget(l)
+            row.addWidget(sl, 1)
+            row.addWidget(vl)
+            right_lay.addLayout(row)
+            return sl
+
+        self._low_sl  = _make_clip_row("Low:", self._clip_low,   0,  20)
+        self._high_sl = _make_clip_row("High:", self._clip_high, 80, 100)
+
+        apply_clip_btn = QPushButton("Apply clip")
+        apply_clip_btn.setFont(QFont("Helvetica", 8))
+        apply_clip_btn.setFixedHeight(24)
+        apply_clip_btn.setObjectName("accentBtn")
+        apply_clip_btn.clicked.connect(self._on_apply_clip)
+        right_lay.addWidget(apply_clip_btn)
+        right_lay.addWidget(_sep())
+
+        # quick processing
+        proc_toggle = QPushButton("[+] Quick Processing")
+        proc_toggle.setFlat(True)
+        proc_toggle.setFont(QFont("Helvetica", 9, QFont.Bold))
+        proc_toggle.setCursor(QCursor(Qt.PointingHandCursor))
+        right_lay.addWidget(proc_toggle)
+
+        self._qproc_widget = QWidget()
+        qp_lay = QVBoxLayout(self._qproc_widget)
+        qp_lay.setContentsMargins(2, 2, 0, 2)
+        qp_lay.setSpacing(4)
+
+        def _qcombo(label, items):
+            row = QHBoxLayout()
+            lb = QLabel(label)
+            lb.setFont(QFont("Helvetica", 8))
+            lb.setFixedWidth(68)
+            cb = QComboBox()
+            cb.addItems(items)
+            cb.setFont(QFont("Helvetica", 8))
+            row.addWidget(lb)
+            row.addWidget(cb, 1)
+            qp_lay.addLayout(row)
+            return cb
+
+        self._qalign_cb  = _qcombo("Align rows:", ["None", "Median", "Mean"])
+        self._qbg_cb     = _qcombo("Background:", ["None", "Plane", "Quadratic"])
+        self._qsmooth_cb = _qcombo("Smooth:", ["None", "Gaussian"])
+
+        smooth_row = QHBoxLayout()
+        sm_lbl = QLabel("σ (px):")
+        sm_lbl.setFont(QFont("Helvetica", 8))
+        sm_lbl.setFixedWidth(40)
+        self._qsmooth_sl  = QSlider(Qt.Horizontal)
+        self._qsmooth_sl.setRange(1, 10)
+        self._qsmooth_sl.setValue(1)
+        self._qsmooth_vl  = QLabel("1")
+        self._qsmooth_vl.setFont(QFont("Helvetica", 8))
+        self._qsmooth_vl.setFixedWidth(20)
+        self._qsmooth_sl.valueChanged.connect(
+            lambda v: self._qsmooth_vl.setText(str(v)))
+        smooth_row.addWidget(sm_lbl)
+        smooth_row.addWidget(self._qsmooth_sl, 1)
+        smooth_row.addWidget(self._qsmooth_vl)
+        qp_lay.addLayout(smooth_row)
+        self._qsmooth_cb.currentIndexChanged.connect(
+            lambda i: self._qsmooth_sl.setEnabled(i != 0))
+        self._qsmooth_sl.setEnabled(False)
+
+        qproc_apply_btn = QPushButton("Apply quick processing")
+        qproc_apply_btn.setFont(QFont("Helvetica", 8))
+        qproc_apply_btn.setFixedHeight(24)
+        qproc_apply_btn.setObjectName("accentBtn")
+        qproc_apply_btn.clicked.connect(self._on_apply_qproc)
+        qp_lay.addWidget(qproc_apply_btn)
+
+        self._qproc_widget.setVisible(False)
+        right_lay.addWidget(self._qproc_widget)
+
+        proc_toggle.clicked.connect(lambda: (
+            self._qproc_widget.setVisible(not self._qproc_widget.isVisible()),
+            proc_toggle.setText(
+                "[-] Quick Processing" if self._qproc_widget.isVisible()
+                else "[+] Quick Processing")
+        ))
+
+        right_lay.addWidget(_sep())
+
+        # save PNG copy
+        save_btn = QPushButton("⬇ Save PNG copy…")
+        save_btn.setFont(QFont("Helvetica", 8, QFont.Bold))
+        save_btn.setFixedHeight(26)
+        save_btn.setObjectName("accentBtn")
+        save_btn.clicked.connect(self._on_save_png)
+        right_lay.addWidget(save_btn)
+
+        right_lay.addStretch()
+
+        right_scroll.setWidget(right)
+        splitter.addWidget(right_scroll)
+        splitter.setSizes([900, 280])
+        root.addWidget(splitter, 1)
+
+        # navigation row
         nav_row = QHBoxLayout()
         self._prev_btn = QPushButton("← Prev")
-        self._prev_btn.setFont(QFont("Helvetica", 11))
-        self._prev_btn.setFixedWidth(100)
+        self._prev_btn.setFont(QFont("Helvetica", 10))
+        self._prev_btn.setFixedWidth(90)
         self._prev_btn.clicked.connect(self._go_prev)
 
-        self._pos_lbl = QLabel("")
+        self._pos_lbl = QLabel()
         self._pos_lbl.setAlignment(Qt.AlignCenter)
-        self._pos_lbl.setFont(QFont("Helvetica", 11))
+        self._pos_lbl.setFont(QFont("Helvetica", 10))
 
         self._next_btn = QPushButton("Next →")
-        self._next_btn.setFont(QFont("Helvetica", 11))
-        self._next_btn.setFixedWidth(100)
+        self._next_btn.setFont(QFont("Helvetica", 10))
+        self._next_btn.setFixedWidth(90)
         self._next_btn.clicked.connect(self._go_next)
 
         close_btn = QPushButton("Close")
-        close_btn.setFont(QFont("Helvetica", 11))
-        close_btn.setFixedWidth(90)
+        close_btn.setFont(QFont("Helvetica", 10))
+        close_btn.setFixedWidth(80)
         close_btn.clicked.connect(self.accept)
 
         nav_row.addWidget(self._prev_btn)
@@ -1046,18 +1355,18 @@ class ImageViewerDialog(QDialog):
         nav_row.addWidget(self._pos_lbl)
         nav_row.addStretch()
         nav_row.addWidget(self._next_btn)
-        nav_row.addSpacing(20)
+        nav_row.addSpacing(16)
         nav_row.addWidget(close_btn)
-        lay.addLayout(nav_row)
+        root.addLayout(nav_row)
 
-        self._load_current()
-
+    # ── Navigation ─────────────────────────────────────────────────────────────
     def keyPressEvent(self, event):
-        if event.key() in (Qt.Key_Escape, Qt.Key_Return):
+        k = event.key()
+        if k in (Qt.Key_Escape, Qt.Key_Return):
             self.accept()
-        elif event.key() == Qt.Key_Left:
+        elif k == Qt.Key_Left:
             self._go_prev()
-        elif event.key() == Qt.Key_Right:
+        elif k == Qt.Key_Right:
             self._go_next()
         else:
             super().keyPressEvent(event)
@@ -1072,18 +1381,51 @@ class ImageViewerDialog(QDialog):
             self._idx += 1
             self._load_current()
 
+    # ── Load / render ──────────────────────────────────────────────────────────
     def _load_current(self):
         entry = self._entries[self._idx]
         self._title_lbl.setText(entry.stem)
+        self.setWindowTitle(entry.stem)
         self._pos_lbl.setText(f"{self._idx + 1} / {len(self._entries)}")
         self._prev_btn.setEnabled(self._idx > 0)
         self._next_btn.setEnabled(self._idx < len(self._entries) - 1)
-        self._img_lbl.setText("Loading…")
+        self._zoom_lbl.setText("Loading…")
+        self._zoom_lbl.setPixmap(QPixmap())
+        # load raw array for histogram
+        self._raw_arr = read_sxm_plane_raw(entry.path, self._ch_cb.currentIndex())
+        self._update_histogram()
+        # load rendered image
         self._token = object()
-        loader = ViewerLoader(entry, self._colormap, self._token, 800, 700,
-                              self._ch_cb.currentIndex())
+        loader = ViewerLoader(entry, self._colormap, self._token, 900, 800,
+                              self._ch_cb.currentIndex(),
+                              self._clip_low, self._clip_high,
+                              self._processing or None)
         loader.signals.loaded.connect(self._on_loaded)
         self._pool.start(loader)
+
+    def _update_histogram(self):
+        arr = self._raw_arr
+        self._ax.cla()
+        if arr is not None:
+            flat = arr[np.isfinite(arr)].ravel()
+            if flat.size > 0:
+                lo = np.percentile(flat, self._clip_low)
+                hi = np.percentile(flat, self._clip_high)
+                bg = self._t.get("bg", "#1e1e2e")
+                fg = self._t.get("fg", "#cdd6f4")
+                self._fig.patch.set_facecolor(bg)
+                self._ax.set_facecolor(bg)
+                self._ax.hist(flat, bins=128, color=self._t.get("accent_bg", "#89b4fa"),
+                              alpha=0.8, density=True, linewidth=0)
+                self._ax.axvline(lo, color="#f38ba8", linewidth=1.2)
+                self._ax.axvline(hi, color="#a6e3a1", linewidth=1.2)
+                self._ax.tick_params(colors=fg, labelsize=6)
+                for spine in self._ax.spines.values():
+                    spine.set_edgecolor(self._t.get("sep", "#45475a"))
+                self._ax.set_yticks([])
+                self._ax.set_xlabel("value", fontsize=6, color=fg)
+        self._fig.tight_layout(pad=0.3)
+        self._canvas.draw()
 
     def _on_channel_changed(self, _: int):
         self._load_current()
@@ -1092,11 +1434,45 @@ class ImageViewerDialog(QDialog):
     def _on_loaded(self, pixmap: QPixmap, token):
         if token is not self._token:
             return
-        sz = self._img_lbl.size()
-        self._img_lbl.setPixmap(
-            pixmap.scaled(sz.width(), sz.height(),
-                          Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        self._img_lbl.setText("")
+        self._zoom_lbl.setText("")
+        self._zoom_lbl.set_source(pixmap)
+
+    # ── Controls ───────────────────────────────────────────────────────────────
+    def _on_apply_clip(self):
+        self._clip_low  = float(self._low_sl.value())
+        self._clip_high = float(self._high_sl.value())
+        self._update_histogram()
+        self._load_current()
+
+    def _on_apply_qproc(self):
+        align_map = {0: None, 1: 'median', 2: 'mean'}
+        bg_map    = {0: None, 1: 1, 2: 2}
+        smooth_i  = self._qsmooth_cb.currentIndex()
+        self._processing = {
+            'align_rows': align_map[self._qalign_cb.currentIndex()],
+            'bg_order':   bg_map[self._qbg_cb.currentIndex()],
+            'smooth_sigma': self._qsmooth_sl.value() if smooth_i != 0 else None,
+        }
+        self._load_current()
+
+    def _on_save_png(self):
+        entry = self._entries[self._idx]
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "Save PNG", str(Path.home() / f"{entry.stem}_viewer.png"),
+            "PNG images (*.png)")
+        if not out_path:
+            return
+        arr = self._raw_arr
+        if arr is None:
+            return
+        try:
+            _proc.export_png(
+                arr, out_path, self._colormap,
+                self._clip_low, self._clip_high,
+                lut_fn=lambda key: _get_lut(key),
+            )
+        except Exception as exc:
+            self._title_lbl.setText(f"Export error: {exc}")
 
 
 # ── Browse tool panel (LEFT) ──────────────────────────────────────────────────
@@ -1109,6 +1485,7 @@ class BrowseToolPanel(QWidget):
     autoclip_requested         = Signal()
     measure_requested          = Signal()
     export_requested           = Signal()
+    undo_requested             = Signal()
 
     def __init__(self, t: dict, cfg: dict, parent=None):
         super().__init__(parent)
@@ -1367,6 +1744,13 @@ class BrowseToolPanel(QWidget):
         self._proc_apply_btn.setObjectName("accentBtn")
         self._proc_apply_btn.clicked.connect(self._on_proc_apply)
         proc_lay.addWidget(self._proc_apply_btn)
+
+        self._undo_btn = QPushButton("↩ Undo last processing")
+        self._undo_btn.setFont(QFont("Helvetica", 8))
+        self._undo_btn.setFixedHeight(26)
+        self._undo_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._undo_btn.clicked.connect(self.undo_requested.emit)
+        proc_lay.addWidget(self._undo_btn)
 
         proc_lay.addWidget(_sep())
 
@@ -2153,6 +2537,7 @@ class ProbeFlowWindow(QMainWindow):
         self._browse_tools.autoclip_requested.connect(self._on_autoclip)
         self._browse_tools.measure_requested.connect(self._on_measure_periodicity)
         self._browse_tools.export_requested.connect(self._on_export)
+        self._browse_tools.undo_requested.connect(self._on_undo)
         self._convert_sidebar.run_btn.clicked.connect(self._run)
         self._conv_panel.input_entry.textChanged.connect(self._update_count)
 
@@ -2316,6 +2701,17 @@ class ProbeFlowWindow(QMainWindow):
         except Exception as exc:
             self._status_bar.showMessage(f"Auto clip error: {exc}")
 
+    def _on_undo(self):
+        selected = self._grid.get_selected()
+        if not selected:
+            self._status_bar.showMessage("Select an image first to undo")
+            return
+        n = self._grid.undo_last(selected)
+        if n == 0:
+            self._status_bar.showMessage("Nothing to undo — no history for current selection")
+        else:
+            self._status_bar.showMessage(f"Undo applied to {n} image{'s' if n > 1 else ''}")
+
     def _on_measure_periodicity(self):
         primary = self._grid.get_primary()
         if not primary:
@@ -2387,9 +2783,14 @@ class ProbeFlowWindow(QMainWindow):
             self._status_bar.showMessage(f"Export error: {exc}")
 
     def _open_viewer(self, entry: SxmFile):
-        t        = THEMES["dark" if self._dark else "light"]
-        cmap_key = self._grid._card_colormaps.get(entry.stem, DEFAULT_CMAP_KEY)
-        dlg      = ImageViewerDialog(entry, self._grid.get_entries(), cmap_key, t, self)
+        t         = THEMES["dark" if self._dark else "light"]
+        cmap_key  = self._grid._card_colormaps.get(entry.stem, DEFAULT_CMAP_KEY)
+        clip      = self._grid._card_clip.get(entry.stem, (self._browse_tools._clip_low,
+                                                            self._browse_tools._clip_high))
+        proc      = self._grid._card_processing.get(entry.stem, {})
+        dlg       = ImageViewerDialog(entry, self._grid.get_entries(), cmap_key, t, self,
+                                      clip_low=clip[0], clip_high=clip[1],
+                                      processing=proc)
         dlg.exec()
 
     # ── Convert ────────────────────────────────────────────────────────────────
