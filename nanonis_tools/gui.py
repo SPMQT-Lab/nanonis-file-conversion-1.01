@@ -1278,20 +1278,32 @@ class ImageViewerDialog(QDialog):
         right_lay.addWidget(_sep())
 
         # histogram
-        hist_lbl = QLabel("Histogram")
+        hist_lbl = QLabel("Histogram — drag the red/green lines to clip")
         hist_lbl.setFont(QFont("Helvetica", 9, QFont.Bold))
+        hist_lbl.setWordWrap(True)
         right_lay.addWidget(hist_lbl)
 
-        self._fig  = Figure(figsize=(2.6, 1.8), dpi=80)
+        self._fig  = Figure(figsize=(2.8, 2.4), dpi=80)
         self._fig.patch.set_alpha(0)
         self._ax   = self._fig.add_subplot(111)
         self._canvas = FigureCanvasQTAgg(self._fig)
-        self._canvas.setFixedHeight(160)
+        self._canvas.setFixedHeight(220)
         right_lay.addWidget(self._canvas)
+
+        # histogram drag state
+        self._low_line      = None
+        self._high_line     = None
+        self._hist_flat_phys: Optional[np.ndarray] = None
+        self._hist_unit     = ""
+        self._dragging      = None  # 'low' | 'high' | None
+        self._canvas.mpl_connect("button_press_event",   self._on_hist_press)
+        self._canvas.mpl_connect("motion_notify_event",  self._on_hist_motion)
+        self._canvas.mpl_connect("button_release_event", self._on_hist_release)
+
         right_lay.addWidget(_sep())
 
-        # clip sliders
-        clip_lbl = QLabel("Clip Range")
+        # clip sliders (percentile — live)
+        clip_lbl = QLabel("Clip (percentile)")
         clip_lbl.setFont(QFont("Helvetica", 9, QFont.Bold))
         right_lay.addWidget(clip_lbl)
 
@@ -1315,13 +1327,16 @@ class ImageViewerDialog(QDialog):
 
         self._low_sl  = _make_clip_row("Low:", self._clip_low,   0,  20)
         self._high_sl = _make_clip_row("High:", self._clip_high, 80, 100)
+        # live update on release (avoid re-rendering on every intermediate tick)
+        self._low_sl.sliderReleased.connect(self._on_slider_clip)
+        self._high_sl.sliderReleased.connect(self._on_slider_clip)
 
-        apply_clip_btn = QPushButton("Apply clip")
-        apply_clip_btn.setFont(QFont("Helvetica", 8))
-        apply_clip_btn.setFixedHeight(24)
-        apply_clip_btn.setObjectName("accentBtn")
-        apply_clip_btn.clicked.connect(self._on_apply_clip)
-        right_lay.addWidget(apply_clip_btn)
+        # Å / pA value readout for current clip
+        self._clip_val_lbl = QLabel("")
+        self._clip_val_lbl.setFont(QFont("Helvetica", 8))
+        self._clip_val_lbl.setAlignment(Qt.AlignCenter)
+        right_lay.addWidget(self._clip_val_lbl)
+
         right_lay.addWidget(_sep())
 
         # quick processing
@@ -1486,29 +1501,136 @@ class ImageViewerDialog(QDialog):
         loader.signals.loaded.connect(self._on_loaded)
         self._pool.start(loader)
 
+    def _channel_unit(self) -> tuple[float, str, str]:
+        """Return (scale, unit_label, axis_label) for the current channel.
+        Z channels (0,1) → Å; current channels (2,3) → pA."""
+        idx = self._ch_cb.currentIndex()
+        if idx < 2:
+            return 1e10, "Å", "Height"
+        return 1e12, "pA", "Current"
+
     def _update_histogram(self):
         arr = self._raw_arr
         self._ax.cla()
-        if arr is not None:
-            flat = arr[np.isfinite(arr)].ravel()
-            if flat.size > 0:
-                lo = np.percentile(flat, self._clip_low)
-                hi = np.percentile(flat, self._clip_high)
-                bg = self._t.get("bg", "#1e1e2e")
-                fg = self._t.get("fg", "#cdd6f4")
-                self._fig.patch.set_facecolor(bg)
-                self._ax.set_facecolor(bg)
-                self._ax.hist(flat, bins=128, color=self._t.get("accent_bg", "#89b4fa"),
-                              alpha=0.8, density=True, linewidth=0)
-                self._ax.axvline(lo, color="#f38ba8", linewidth=1.2)
-                self._ax.axvline(hi, color="#a6e3a1", linewidth=1.2)
-                self._ax.tick_params(colors=fg, labelsize=6)
-                for spine in self._ax.spines.values():
-                    spine.set_edgecolor(self._t.get("sep", "#45475a"))
-                self._ax.set_yticks([])
-                self._ax.set_xlabel("value", fontsize=6, color=fg)
-        self._fig.tight_layout(pad=0.3)
-        self._canvas.draw()
+        self._low_line  = None
+        self._high_line = None
+        self._hist_flat_phys = None
+
+        if arr is None:
+            self._canvas.draw_idle()
+            return
+
+        flat = arr[np.isfinite(arr)].ravel()
+        if flat.size == 0:
+            self._canvas.draw_idle()
+            return
+
+        scale, unit, axis_label = self._channel_unit()
+        flat_phys = flat.astype(np.float64) * scale
+        self._hist_flat_phys = flat_phys
+        self._hist_unit = unit
+
+        lo_phys = float(np.percentile(flat_phys, self._clip_low))
+        hi_phys = float(np.percentile(flat_phys, self._clip_high))
+
+        bg = self._t.get("bg", "#1e1e2e")
+        fg = self._t.get("fg", "#cdd6f4")
+        self._fig.patch.set_facecolor(bg)
+        self._ax.set_facecolor(bg)
+
+        self._ax.hist(flat_phys, bins=128,
+                      color=self._t.get("accent_bg", "#89b4fa"),
+                      alpha=0.85, linewidth=0)
+        self._low_line  = self._ax.axvline(lo_phys, color="#f38ba8",
+                                            linewidth=1.6, picker=6)
+        self._high_line = self._ax.axvline(hi_phys, color="#a6e3a1",
+                                            linewidth=1.6, picker=6)
+
+        self._ax.tick_params(colors=fg, labelsize=7)
+        for spine in self._ax.spines.values():
+            spine.set_edgecolor(self._t.get("sep", "#45475a"))
+        self._ax.set_xlabel(f"{axis_label} [{unit}]", fontsize=8, color=fg)
+        self._ax.set_ylabel("Count", fontsize=8, color=fg)
+
+        self._fig.tight_layout(pad=0.4)
+        self._canvas.draw_idle()
+
+        self._clip_val_lbl.setText(
+            f"{lo_phys:.3g} {unit}  →  {hi_phys:.3g} {unit}")
+
+    # ── Histogram drag handlers ────────────────────────────────────────────────
+    def _on_hist_press(self, event):
+        if (event.inaxes is not self._ax or event.xdata is None
+                or event.button != 1
+                or self._low_line is None or self._high_line is None):
+            return
+        lo = self._low_line.get_xdata()[0]
+        hi = self._high_line.get_xdata()[0]
+        x0, x1 = self._ax.get_xlim()
+        tol = 0.04 * (x1 - x0) if x1 > x0 else 0.0
+        d_lo = abs(event.xdata - lo)
+        d_hi = abs(event.xdata - hi)
+        # pick closest line; if far from both, move the closer one
+        if d_lo <= d_hi:
+            self._dragging = 'low'
+        else:
+            self._dragging = 'high'
+        # only engage drag if within tolerance OR click outside both lines
+        if min(d_lo, d_hi) > tol and (lo <= event.xdata <= hi):
+            self._dragging = None
+
+    def _on_hist_motion(self, event):
+        if (self._dragging is None or event.inaxes is not self._ax
+                or event.xdata is None
+                or self._low_line is None or self._high_line is None):
+            return
+        x = float(event.xdata)
+        lo = self._low_line.get_xdata()[0]
+        hi = self._high_line.get_xdata()[0]
+        if self._dragging == 'low':
+            x = min(x, hi - 1e-12)
+            self._low_line.set_xdata([x, x])
+        else:
+            x = max(x, lo + 1e-12)
+            self._high_line.set_xdata([x, x])
+        if self._hist_flat_phys is not None and self._clip_val_lbl is not None:
+            new_lo = self._low_line.get_xdata()[0]
+            new_hi = self._high_line.get_xdata()[0]
+            self._clip_val_lbl.setText(
+                f"{new_lo:.3g} {self._hist_unit}  →  {new_hi:.3g} {self._hist_unit}")
+        self._canvas.draw_idle()
+
+    def _on_hist_release(self, event):
+        if self._dragging is None or self._hist_flat_phys is None:
+            self._dragging = None
+            return
+        flat = self._hist_flat_phys
+        n = flat.size
+        lo_x = float(self._low_line.get_xdata()[0])
+        hi_x = float(self._high_line.get_xdata()[0])
+        # convert value → percentile via rank
+        low_pct  = float((flat <= lo_x).sum()) / n * 100.0
+        high_pct = float((flat <= hi_x).sum()) / n * 100.0
+        # clamp to slider ranges
+        low_pct  = max(0.0,  min(low_pct,  20.0))
+        high_pct = max(80.0, min(high_pct, 100.0))
+        if high_pct <= low_pct:
+            high_pct = min(100.0, low_pct + 1.0)
+        self._clip_low  = low_pct
+        self._clip_high = high_pct
+        self._low_sl.blockSignals(True)
+        self._high_sl.blockSignals(True)
+        self._low_sl.setValue(int(round(low_pct)))
+        self._high_sl.setValue(int(round(high_pct)))
+        self._low_sl.blockSignals(False)
+        self._high_sl.blockSignals(False)
+        self._dragging = None
+        self._load_current()
+
+    def _on_slider_clip(self):
+        self._clip_low  = float(self._low_sl.value())
+        self._clip_high = float(self._high_sl.value())
+        self._load_current()
 
     def _on_channel_changed(self, _: int):
         self._load_current()
@@ -1521,12 +1643,6 @@ class ImageViewerDialog(QDialog):
         self._zoom_lbl.set_source(pixmap)
 
     # ── Controls ───────────────────────────────────────────────────────────────
-    def _on_apply_clip(self):
-        self._clip_low  = float(self._low_sl.value())
-        self._clip_high = float(self._high_sl.value())
-        self._update_histogram()
-        self._load_current()
-
     def _on_apply_qproc(self):
         align_map = {0: None, 1: 'median', 2: 'mean'}
         bg_map    = {0: None, 1: 1, 2: 2}
