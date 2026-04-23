@@ -35,9 +35,20 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_CUSHION_DIR = _REPO_ROOT / "src" / "file_cushions"
 
 _DATA_OFFSET_CACHE: Optional[int] = None
+_POST_END_BYTES_CACHE: Optional[bytes] = None
+_PRE_PAYLOAD_BYTES_CACHE: Optional[bytes] = None
+
+# Nanonis SXM files terminate their text header with this marker.
+_SCANIT_END_MARKER = b":SCANIT_END:"
 
 
 def _data_offset(cushion_dir: Optional[Path] = None) -> int:
+    """Return the reference cushion's fixed data offset.
+
+    Used as a sanity-check fallback; most call sites prefer
+    :func:`_data_offset_in_file` which scans the actual file for
+    ``:SCANIT_END:`` and is robust to headers of any length.
+    """
     global _DATA_OFFSET_CACHE
     if cushion_dir is None and _DATA_OFFSET_CACHE is not None:
         return _DATA_OFFSET_CACHE
@@ -46,6 +57,38 @@ def _data_offset(cushion_dir: Optional[Path] = None) -> int:
     if cushion_dir == _DEFAULT_CUSHION_DIR:
         _DATA_OFFSET_CACHE = offset
     return offset
+
+
+def _cushion_tail_lens(cushion_dir: Optional[Path] = None) -> Tuple[int, int]:
+    """Return ``(len(post_end_bytes), len(pre_payload_bytes))`` from the cushion."""
+    global _POST_END_BYTES_CACHE, _PRE_PAYLOAD_BYTES_CACHE
+    if (cushion_dir is None and _POST_END_BYTES_CACHE is not None
+            and _PRE_PAYLOAD_BYTES_CACHE is not None):
+        return len(_POST_END_BYTES_CACHE), len(_PRE_PAYLOAD_BYTES_CACHE)
+    cushion_dir = Path(cushion_dir) if cushion_dir else _DEFAULT_CUSHION_DIR
+    post = (cushion_dir / "post_end_bytes.bin").read_bytes()
+    pre = (cushion_dir / "pre_payload_bytes.bin").read_bytes()
+    if cushion_dir == _DEFAULT_CUSHION_DIR:
+        _POST_END_BYTES_CACHE = post
+        _PRE_PAYLOAD_BYTES_CACHE = pre
+    return len(post), len(pre)
+
+
+def _data_offset_in_file(
+    raw: bytes,
+    cushion_dir: Optional[Path] = None,
+) -> int:
+    """Compute the byte offset of the binary payload in a given .sxm file.
+
+    Locates ``:SCANIT_END:`` and adds the fixed post-marker + pre-payload
+    padding lengths from the cushion.  Unlike :func:`_data_offset`, this is
+    robust to header length variation across files.
+    """
+    idx = raw.find(_SCANIT_END_MARKER)
+    if idx < 0:
+        raise ValueError("No :SCANIT_END: marker in .sxm file")
+    post_len, pre_len = _cushion_tail_lens(cushion_dir)
+    return idx + len(_SCANIT_END_MARKER) + post_len + pre_len
 
 
 # ── Header parsing ───────────────────────────────────────────────────────────
@@ -134,8 +177,8 @@ def read_sxm_plane(
         Nx, Ny = sxm_dims(hdr)
         if Nx <= 0 or Ny <= 0:
             return None
-        offset = _data_offset(cushion_dir)
         raw = Path(sxm_path).read_bytes()
+        offset = _data_offset_in_file(raw, cushion_dir)
         plane_bytes = Ny * Nx * 4
         start = offset + plane_idx * plane_bytes
         if start + plane_bytes > len(raw):
@@ -157,8 +200,8 @@ def read_all_sxm_planes(
     """Return (header_dict, [plane0, plane1, plane2, plane3])."""
     hdr = parse_sxm_header(sxm_path)
     Nx, Ny = sxm_dims(hdr)
-    offset = _data_offset(cushion_dir)
     raw = Path(sxm_path).read_bytes()
+    offset = _data_offset_in_file(raw, cushion_dir)
     plane_bytes = Ny * Nx * 4
     planes: List[np.ndarray] = []
     for idx in range(4):
@@ -196,9 +239,9 @@ def write_sxm_with_planes(
 
     hdr = parse_sxm_header(src_sxm)
     Nx, Ny = sxm_dims(hdr)
-    offset = _data_offset(cushion_dir)
 
     raw = src_sxm.read_bytes()
+    offset = _data_offset_in_file(raw, cushion_dir)
     plane_bytes = Ny * Nx * 4
 
     header_prefix = raw[:offset]

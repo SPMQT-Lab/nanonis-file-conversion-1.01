@@ -20,6 +20,8 @@
 
 Everything is available as a CLI subcommand, so corrections and conversions can be scripted across hundreds of files or wired into a processing pipeline.
 
+Since **v1.4** all topography commands (`plane-bg`, `align-rows`, `smooth`, `sxm2png`, `pipeline`, `info`, `grains`, `autoclip`, `periodicity` …) accept **either** `.sxm` **or** `.dat` inputs transparently — the format is auto-detected, so conversion is no longer a mandatory first step before analysis.
+
 ---
 
 ## Installation

@@ -49,6 +49,7 @@ from PIL import Image
 
 from probeflow import processing as _proc
 from probeflow.common import setup_logging
+from probeflow.scan import Scan, load_scan
 from probeflow.sxm_io import (
     parse_sxm_header,
     read_all_sxm_planes,
@@ -117,46 +118,45 @@ def _derive_output(args: argparse.Namespace, suffix: str) -> Path:
 
 
 def _apply_to_plane(
-    sxm_path: Path,
+    input_path: Path,
     plane_idx: int,
     op: Callable[[np.ndarray], np.ndarray],
-) -> Tuple[dict, List[np.ndarray], np.ndarray]:
-    """Apply ``op`` to one plane, return (hdr, all_planes_modified, processed)."""
-    hdr, planes = read_all_sxm_planes(sxm_path, orient=True)
-    if plane_idx >= len(planes):
+) -> Scan:
+    """Load a scan, apply ``op`` to one plane in place, return the Scan.
+
+    Accepts ``.sxm`` *or* ``.dat`` input — dispatch happens in ``load_scan``.
+    """
+    scan = load_scan(input_path)
+    if plane_idx >= scan.n_planes:
         raise ValueError(
-            f"Plane {plane_idx} not present — file has {len(planes)} plane(s)"
+            f"Plane {plane_idx} not present — file has {scan.n_planes} plane(s)"
         )
-    processed = op(planes[plane_idx])
-    # Only rewrite the forward-plane half to keep forward/backward self-consistent
-    planes[plane_idx] = processed
-    return hdr, planes, processed
+    scan.planes[plane_idx] = op(scan.planes[plane_idx])
+    return scan
 
 
 def _write_output(
     args: argparse.Namespace,
-    hdr: dict,
-    planes: List[np.ndarray],
-    processed: np.ndarray,
+    scan: Scan,
     default_suffix: str,
 ) -> Path:
     """Write either an .sxm (all planes) or a colorised PNG (selected plane)."""
     if args.png:
         out_path = _derive_output(args, ".png" if default_suffix == ".sxm"
                                    else default_suffix)
-        w_m, h_m = sxm_scan_range(hdr)
-        _proc.export_png(
-            processed, out_path, args.colormap,
-            args.clip_low, args.clip_high,
-            lut_fn=_lut_from_matplotlib,
-            scan_range_m=(w_m, h_m),
+        scan.save_png(
+            out_path,
+            plane_idx=args.plane,
+            colormap=args.colormap,
+            clip_low=args.clip_low,
+            clip_high=args.clip_high,
             add_scalebar=not args.no_scalebar,
             scalebar_unit=args.scalebar_unit,
             scalebar_pos=args.scalebar_pos,
         )
     else:
         out_path = _derive_output(args, default_suffix)
-        write_sxm_with_planes(args.input, out_path, planes)
+        scan.save_sxm(out_path)
     log.info("[OK] %s → %s", args.input.name, out_path)
     return out_path
 
@@ -197,16 +197,29 @@ def _op_fft(mode: str, cutoff: float,
 
 def _cmd_single_op(args, op: Callable[[np.ndarray], np.ndarray]) -> int:
     setup_logging(args.verbose)
-    hdr, planes, processed = _apply_to_plane(args.input, args.plane, op)
-    _write_output(args, hdr, planes, processed, default_suffix=".sxm")
+    scan = _apply_to_plane(args.input, args.plane, op)
+    _write_output(args, scan, default_suffix=".sxm")
     return 0
+
+
+def _load_plane_for_analysis(args):
+    """Load one plane from an .sxm or .dat input; return the numpy array or None."""
+    try:
+        scan = load_scan(args.input)
+    except Exception as exc:
+        log.error("Could not load %s: %s", args.input, exc)
+        return None
+    if args.plane >= scan.n_planes:
+        log.error("Plane %d not present (file has %d)",
+                  args.plane, scan.n_planes)
+        return None
+    return scan.planes[args.plane]
 
 
 def _cmd_grains(args) -> int:
     setup_logging(args.verbose)
-    arr = read_sxm_plane(args.input, plane_idx=args.plane)
+    arr = _load_plane_for_analysis(args)
     if arr is None:
-        log.error("Could not read plane %d of %s", args.plane, args.input)
         return 1
     label_map, n, stats = _proc.detect_grains(
         arr,
@@ -235,9 +248,8 @@ def _cmd_grains(args) -> int:
 
 def _cmd_autoclip(args) -> int:
     setup_logging(args.verbose)
-    arr = read_sxm_plane(args.input, plane_idx=args.plane)
+    arr = _load_plane_for_analysis(args)
     if arr is None:
-        log.error("Could not read plane %d of %s", args.plane, args.input)
         return 1
     low, high = _proc.gmm_autoclip(arr)
     if args.json:
@@ -250,16 +262,21 @@ def _cmd_autoclip(args) -> int:
 
 def _cmd_periodicity(args) -> int:
     setup_logging(args.verbose)
-    hdr = parse_sxm_header(args.input)
-    Nx, Ny = sxm_dims(hdr)
-    w_m, h_m = sxm_scan_range(hdr)
+    try:
+        scan = load_scan(args.input)
+    except Exception as exc:
+        log.error("Could not load %s: %s", args.input, exc)
+        return 1
+    Nx, Ny = scan.dims
+    w_m, h_m = scan.scan_range_m
     if w_m <= 0 or h_m <= 0 or Nx <= 0 or Ny <= 0:
-        log.error("Invalid SCAN_RANGE / SCAN_PIXELS in %s", args.input)
+        log.error("Invalid scan range / pixel dims in %s", args.input)
         return 1
-    arr = read_sxm_plane(args.input, plane_idx=args.plane)
-    if arr is None:
-        log.error("Could not read plane %d of %s", args.plane, args.input)
+    if args.plane >= scan.n_planes:
+        log.error("Plane %d not present (file has %d)",
+                  args.plane, scan.n_planes)
         return 1
+    arr = scan.planes[args.plane]
     peaks = _proc.measure_periodicity(
         arr,
         pixel_size_x_m=w_m / Nx,
@@ -277,19 +294,22 @@ def _cmd_periodicity(args) -> int:
 
 
 def _cmd_sxm2png(args) -> int:
+    """Render any supported scan (.sxm or .dat) to a PNG."""
     setup_logging(args.verbose)
-    arr = read_sxm_plane(args.input, plane_idx=args.plane)
-    if arr is None:
-        log.error("Could not read plane %d of %s", args.plane, args.input)
+    try:
+        scan = load_scan(args.input)
+    except Exception as exc:
+        log.error("Could not load %s: %s", args.input, exc)
         return 1
-    hdr = parse_sxm_header(args.input)
-    w_m, h_m = sxm_scan_range(hdr)
+    if args.plane >= scan.n_planes:
+        log.error("Plane %d not present (file has %d)",
+                  args.plane, scan.n_planes)
+        return 1
     out = args.output or args.input.with_suffix(".png")
-    _proc.export_png(
-        arr, out, args.colormap,
-        args.clip_low, args.clip_high,
-        lut_fn=_lut_from_matplotlib,
-        scan_range_m=(w_m, h_m),
+    scan.save_png(
+        out, plane_idx=args.plane,
+        colormap=args.colormap,
+        clip_low=args.clip_low, clip_high=args.clip_high,
         add_scalebar=not args.no_scalebar,
         scalebar_unit=args.scalebar_unit,
         scalebar_pos=args.scalebar_pos,
@@ -300,24 +320,44 @@ def _cmd_sxm2png(args) -> int:
 
 def _cmd_info(args) -> int:
     setup_logging(args.verbose)
-    hdr = parse_sxm_header(args.input)
-    Nx, Ny = sxm_dims(hdr)
-    w_m, h_m = sxm_scan_range(hdr)
+    try:
+        scan = load_scan(args.input)
+    except Exception as exc:
+        log.error("Could not load %s: %s", args.input, exc)
+        return 1
+    Nx, Ny = scan.dims
+    w_m, h_m = scan.scan_range_m
+    hdr = scan.header
     if args.json:
         print(json.dumps({
             "file": str(args.input),
+            "format": scan.source_format,
             "Nx": Nx, "Ny": Ny,
+            "n_planes": scan.n_planes,
+            "plane_names": scan.plane_names,
+            "plane_synthetic": scan.plane_synthetic,
             "scan_range_m": [w_m, h_m],
             "header": hdr,
         }, indent=2))
         return 0
     print(f"file      : {args.input}")
+    print(f"format    : {scan.source_format}")
     print(f"pixels    : {Nx} x {Ny}")
     print(f"scan size : {w_m*1e9:.3f} nm × {h_m*1e9:.3f} nm")
-    for key in ("REC_DATE", "REC_TIME", "BIAS", "SCAN_DIR",
-                "SCAN_ANGLE", "SCAN_OFFSET", "COMMENT"):
+    print(f"planes    : {scan.n_planes}")
+    if any(scan.plane_synthetic):
+        synth_idx = [i for i, s in enumerate(scan.plane_synthetic) if s]
+        print(f"synthetic : {synth_idx}")
+    # Format-specific header highlights.
+    if scan.source_format == "sxm":
+        keys = ("REC_DATE", "REC_TIME", "BIAS", "SCAN_DIR",
+                "SCAN_ANGLE", "SCAN_OFFSET", "COMMENT")
+    else:  # dat
+        keys = ("Titel", "Biasvolt[mV]", "SetPoint", "ScanYDirec",
+                "DAC-Type", "T_AUXADC6[K]")
+    for key in keys:
         if key in hdr and hdr[key]:
-            print(f"{key:10s}: {hdr[key]}")
+            print(f"{key:14s}: {hdr[key]}")
     return 0
 
 
@@ -370,8 +410,8 @@ def _cmd_pipeline(args) -> int:
             a = op(a)
         return a
 
-    hdr, planes, processed = _apply_to_plane(args.input, args.plane, _compose)
-    _write_output(args, hdr, planes, processed, default_suffix=".sxm")
+    scan = _apply_to_plane(args.input, args.plane, _compose)
+    _write_output(args, scan, default_suffix=".sxm")
     return 0
 
 
