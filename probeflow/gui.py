@@ -58,7 +58,14 @@ def _open_url(url: str) -> None:
     except Exception:
         pass
 
-from nanonis_tools import processing as _proc
+from probeflow import processing as _proc
+from probeflow.sxm_io import (
+    parse_sxm_header,
+    sxm_dims as _sxm_dims,
+    sxm_scan_range as _sxm_scan_range,
+    orient_plane as _orient_plane,
+    read_sxm_plane as read_sxm_plane_raw,
+)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 CONFIG_PATH     = Path.home() / ".probeflow_config.json"
@@ -233,40 +240,7 @@ def _card_meta_str(entry: SxmFile) -> str:
     return "\n".join(filter(None, [line1, line2]))
 
 
-# ── SXM parsing ───────────────────────────────────────────────────────────────
-def parse_sxm_header(sxm_path: Path) -> dict:
-    params: dict              = {}
-    current_key: Optional[str] = None
-    buf: list[str]            = []
-
-    def _flush():
-        if current_key is not None:
-            params[current_key] = " ".join(buf).strip()
-
-    try:
-        with open(sxm_path, "rb") as fh:
-            for raw in fh:
-                if raw.strip() == b":SCANIT_END:":
-                    break
-                line = raw.decode("latin-1", errors="replace").rstrip("\r\n")
-                if line.startswith(":") and line.endswith(":") and len(line) > 2:
-                    _flush()
-                    current_key = line[1:-1]
-                    buf = []
-                elif current_key is not None:
-                    s = line.strip()
-                    if s:
-                        buf.append(s)
-        _flush()
-    except Exception:
-        pass
-    return params
-
-
-def _sxm_dims(hdr: dict) -> tuple[int, int]:
-    nums = [int(x) for x in _re.findall(r"\d+", hdr.get("SCAN_PIXELS", ""))]
-    return (nums[0], nums[1]) if len(nums) >= 2 else (512, 512)
-
+# ── SXM parsing / plane I/O live in probeflow.sxm_io (imported above). ──────
 
 def render_sxm_plane(
     sxm_path:  Path,
@@ -312,62 +286,6 @@ def render_sxm_plane(
         return img
     except Exception:
         return None
-
-
-def read_sxm_plane_raw(sxm_path: Path, plane_idx: int = 0) -> Optional[np.ndarray]:
-    """Read orientation-corrected float64 array for a plane from an SXM file."""
-    try:
-        hdr    = parse_sxm_header(sxm_path)
-        Nx, Ny = _sxm_dims(hdr)
-        if Nx <= 0 or Ny <= 0:
-            return None
-
-        data_offset = int((DEFAULT_CUSHION / "data_offset.txt").read_text().strip())
-        raw = sxm_path.read_bytes()
-
-        plane_bytes = Ny * Nx * 4
-        start = data_offset + plane_idx * plane_bytes
-        if start + plane_bytes > len(raw):
-            return None
-
-        arr = np.frombuffer(raw[start: start + plane_bytes], dtype=">f4").copy()
-        arr = arr.reshape((Ny, Nx))
-        arr = _orient_plane(arr, hdr, plane_idx)
-        return arr.astype(np.float64)
-    except Exception:
-        return None
-
-
-def _sxm_scan_range(hdr: dict) -> tuple[float, float]:
-    """Return (width_m, height_m) from the SCAN_RANGE header entry."""
-    nums = _re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?",
-                       hdr.get("SCAN_RANGE", ""))
-    if len(nums) >= 2:
-        try:
-            return (float(nums[0]), float(nums[1]))
-        except ValueError:
-            pass
-    return (0.0, 0.0)
-
-
-def _orient_plane(arr: np.ndarray, hdr: dict, plane_idx: int) -> np.ndarray:
-    """
-    Apply canonical display orientation for Nanonis SXM data.
-
-    Two corrections are needed:
-    1. SCAN_DIR='up': the tip scanned bottom-to-top, so row 0 in the file
-       is the bottom of the image.  Flip vertically so origin is top-left.
-    2. Backward scans (odd plane_idx: Z bwd=1, I bwd=3, …): the tip scanned
-       right-to-left, so the image is mirrored.  Flip horizontally to match
-       the forward-scan orientation.
-    """
-    scan_dir = hdr.get("SCAN_DIR", "down").strip().lower()
-    if scan_dir == "up":
-        arr = np.flipud(arr)
-    # Odd plane indices are backward (right-to-left) scans
-    if plane_idx % 2 == 1:
-        arr = np.fliplr(arr)
-    return arr
 
 
 def render_with_processing(
@@ -695,7 +613,7 @@ class ConversionWorker(QRunnable):
         out_path = Path(self.out_dir)
         try:
             if self.do_png:
-                from nanonis_tools.dats_to_pngs import main as png_main
+                from probeflow.dat_png import main as png_main
                 _log("── PNG conversion ──", "info")
                 png_main(src=in_path, out_root=out_path / "png",
                          clip_low=self.clip_low, clip_high=self.clip_high,
@@ -703,7 +621,7 @@ class ConversionWorker(QRunnable):
                 _log("PNG done.", "ok")
 
             if self.do_sxm:
-                from nanonis_tools.dat_sxm_cli import convert_dat_to_sxm
+                from probeflow.dat_sxm import convert_dat_to_sxm
                 _log("── SXM conversion ──", "info")
                 files = sorted(in_path.glob("*.dat"))
                 if not files:
@@ -1667,10 +1585,13 @@ class ImageViewerDialog(QDialog):
             self._status_lbl.setText("No data to save.")
             return
         try:
+            hdr = parse_sxm_header(entry.path)
+            w_m, h_m = _sxm_scan_range(hdr)
             _proc.export_png(
                 arr, out_path, self._colormap,
                 self._clip_low, self._clip_high,
                 lut_fn=lambda key: _get_lut(key),
+                scan_range_m=(w_m, h_m),
             )
             self._status_lbl.setText(f"Saved → {Path(out_path).name}")
         except Exception as exc:
@@ -2077,10 +1998,25 @@ class BrowseInfoPanel(QWidget):
         self.name_lbl = QLabel("No scan selected")
         self.name_lbl.setFont(QFont("Helvetica", 9, QFont.Bold))
         self.name_lbl.setWordWrap(True)
-        self.dim_lbl = QLabel("")
-        self.dim_lbl.setFont(QFont("Helvetica", 8))
         lay.addWidget(self.name_lbl)
-        lay.addWidget(self.dim_lbl)
+
+        # Quick-info grid (pixels, size, bias, setpoint). Filled by show_entry().
+        qi_grid = QGridLayout()
+        qi_grid.setSpacing(4)
+        qi_grid.setContentsMargins(0, 2, 0, 2)
+        self._qi: dict[str, QLabel] = {}
+        _QI_ROWS = [("Pixels", "pixels"), ("Size", "size"),
+                    ("Bias",   "bias"),   ("Setp.", "setp")]
+        for i, (title, key) in enumerate(_QI_ROWS):
+            r, c = divmod(i, 2)
+            t_lbl = QLabel(title + ":")
+            t_lbl.setFont(QFont("Helvetica", 8))
+            v_lbl = QLabel("—")
+            v_lbl.setFont(QFont("Helvetica", 8, QFont.Bold))
+            qi_grid.addWidget(t_lbl, r, c * 2)
+            qi_grid.addWidget(v_lbl, r, c * 2 + 1)
+            self._qi[key] = v_lbl
+        lay.addLayout(qi_grid)
         lay.addWidget(_sep())
 
         ch_hdr = QLabel("Channels")

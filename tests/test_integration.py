@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from nanonis_tools.dats_to_pngs import dat_to_hdr_imgs
-from nanonis_tools.dat_sxm_cli import process_dat, convert_dat_to_sxm
+from probeflow.dat_png import dat_to_hdr_imgs
+from probeflow.dat_sxm import process_dat, convert_dat_to_sxm
 
 
 # ─── PNG conversion ───────────────────────────────────────────────────────────

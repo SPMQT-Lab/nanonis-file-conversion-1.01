@@ -1,8 +1,8 @@
-"""Unit tests for nanonis_tools.common."""
+"""Unit tests for probeflow.common."""
 
 import numpy as np
 import pytest
-from nanonis_tools.common import (
+from probeflow.common import (
     DAC_BITS_DEFAULT,
     DAC_VOLTAGE_REF,
     _f,
