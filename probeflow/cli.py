@@ -421,6 +421,37 @@ def _cmd_gui(_args) -> int:
     return 0
 
 
+def _cmd_convert(args) -> int:
+    """Suffix-driven any-in/any-out topography conversion."""
+    setup_logging(args.verbose)
+    try:
+        scan = load_scan(args.input)
+    except Exception as exc:
+        log.error("Could not load %s: %s", args.input, exc)
+        return 1
+
+    out = Path(args.output)
+    extra: dict = {}
+    # Build a small kwargs set shared by the image writers.
+    if args.colormap is not None:
+        extra["colormap"] = args.colormap
+    if args.clip_low is not None:
+        extra["clip_low"] = args.clip_low
+    if args.clip_high is not None:
+        extra["clip_high"] = args.clip_high
+    # TIFF-specific: format mode
+    if out.suffix.lower() in (".tif", ".tiff") and args.tiff_mode is not None:
+        extra["mode"] = args.tiff_mode
+
+    try:
+        scan.save(out, plane_idx=args.plane, **extra)
+    except Exception as exc:
+        log.error("Could not write %s: %s", out, exc)
+        return 1
+    log.info("[OK] %s → %s", args.input.name, out)
+    return 0
+
+
 def _cmd_dat2sxm(args) -> int:
     from probeflow.dat_sxm import main as _main
     forwarded = args.rest[1:] if args.rest and args.rest[0] == "--" else args.rest
@@ -711,6 +742,27 @@ def _build_parser() -> argparse.ArgumentParser:
 
     gui = sub.add_parser("gui", help="Launch the ProbeFlow graphical interface")
     gui.set_defaults(func=_cmd_gui)
+
+    # ── any-in/any-out convert ──
+    convert = sub.add_parser("convert",
+        help=("Convert any supported scan (.sxm / .dat / .gwy / .sm4 / .mtrx) "
+              "to any supported output (.sxm / .png / .pdf / .tif / .gwy / .csv)"))
+    convert.add_argument("input", type=Path,
+        help="Input scan (format auto-detected from suffix)")
+    convert.add_argument("output", type=Path,
+        help="Output file (format auto-detected from suffix)")
+    convert.add_argument("--plane", type=int, default=0,
+        help="Plane index for single-plane outputs (default 0)")
+    convert.add_argument("--colormap", default=None,
+        help="Matplotlib colormap (for PNG / PDF)")
+    convert.add_argument("--clip-low", type=float, default=None,
+        help="Lower percentile clip (default 1.0)")
+    convert.add_argument("--clip-high", type=float, default=None,
+        help="Upper percentile clip (default 99.0)")
+    convert.add_argument("--tiff-mode", choices=("float", "uint16"),
+        default=None, help="TIFF output mode (default: float)")
+    convert.add_argument("--verbose", action="store_true")
+    convert.set_defaults(func=_cmd_convert)
 
     # ── spectroscopy ──
     spec_info = sub.add_parser("spec-info",

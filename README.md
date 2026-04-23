@@ -22,6 +22,8 @@ Everything is available as a CLI subcommand, so corrections and conversions can 
 
 Since **v1.4** all topography commands (`plane-bg`, `align-rows`, `smooth`, `sxm2png`, `pipeline`, `info`, `grains`, `autoclip`, `periodicity` …) accept **either** `.sxm` **or** `.dat` inputs transparently — the format is auto-detected, so conversion is no longer a mandatory first step before analysis.
 
+Since **v1.5** ProbeFlow also reads **Gwyddion `.gwy`**, **RHK `.sm4`**, and **Omicron Matrix `.mtrx`** (via optional extras), and writes **PDF**, **TIFF**, **GWY**, and **CSV** in addition to `.sxm` / `.png`.  The `probeflow convert` subcommand is a one-shot any-in/any-out converter driven purely by file suffixes.
+
 ---
 
 ## Installation
@@ -33,6 +35,17 @@ python -m pip install -e .
 ```
 
 Python 3.11+ is required. The install pulls in `numpy`, `scipy`, `pillow`, `matplotlib`, and `PySide6`.
+
+**Optional extras** for vendor-specific formats:
+
+```bash
+pip install probeflow[omicron]    # Omicron Matrix (.mtrx)   via access2thematrix
+pip install probeflow[rhk]        # RHK             (.sm4)   via spym
+pip install probeflow[gwyddion]   # Gwyddion        (.gwy)   via gwyfile
+pip install probeflow[all]        # everything above
+```
+
+Without any extras, ProbeFlow still fully supports `.sxm` and `.dat` on both the read and write sides.
 
 ---
 
@@ -72,11 +85,29 @@ The top-level command is `probeflow`. Every subcommand accepts `--help`.
 
 | Command   | Purpose                                                            |
 |-----------|--------------------------------------------------------------------|
+| `convert` | Suffix-driven any-in / any-out conversion (recommended)            |
 | `dat2sxm` | Createc `.dat` → Nanonis `.sxm` (use `--` to pass through flags)   |
 | `dat2png` | Createc `.dat` → preview PNGs                                      |
 | `sxm2png` | Nanonis `.sxm` → colorised PNG with optional scale bar             |
 
 Legacy shortcuts `dat-sxm` and `dat-png` remain available for backward compatibility.
+
+#### `probeflow convert`
+
+Reads any supported scan format and writes any supported output, picking both ends from file suffixes.
+
+**Read:** `.sxm` · `.dat` · `.gwy` · `.sm4` · `.mtrx` (or `.Z_mtrx` / `.I_mtrx`)
+**Write:** `.sxm` · `.png` · `.pdf` · `.tif` / `.tiff` · `.gwy` · `.csv`
+
+```bash
+probeflow convert scan.dat scan.pdf --colormap inferno            # Createc .dat → publication-ready PDF
+probeflow convert scan.sxm scan.gwy                               # Nanonis .sxm → Gwyddion .gwy
+probeflow convert scan.sxm scan.tif --tiff-mode float             # full-precision TIFF
+probeflow convert scan.sxm scan.tif --tiff-mode uint16 --clip-low 2 --clip-high 98
+probeflow convert scan.sm4 scan.png --colormap viridis            # RHK → PNG
+probeflow convert default_0001.Z_mtrx scan.sxm                    # Omicron Matrix → Nanonis
+probeflow convert scan.dat line0.csv --plane 0                    # single plane → CSV grid
+```
 
 ### Processing (`.sxm` in → `.sxm` or `.png` out)
 
