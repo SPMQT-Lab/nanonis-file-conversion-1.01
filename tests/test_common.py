@@ -7,6 +7,7 @@ from probeflow.common import (
     DAC_VOLTAGE_REF,
     _f,
     _i,
+    check_overwrite,
     detect_channels,
     find_hdr,
     get_dac_bits,
@@ -283,3 +284,18 @@ class TestMarkProcessedStem:
 
     def test_does_not_duplicate_marker(self):
         assert mark_processed_stem("scan001_processed") == "scan001_processed"
+
+
+# ─── check_overwrite ──────────────────────────────────────────────────────────
+
+class TestCheckOverwrite:
+    def test_raises_when_same_path(self, tmp_path):
+        f = tmp_path / "scan.sxm"
+        f.touch()
+        with pytest.raises(ValueError, match="overwrite"):
+            check_overwrite(f, f)
+
+    def test_no_raise_for_different_paths(self, tmp_path):
+        inp = tmp_path / "scan.sxm"
+        out = tmp_path / "scan_processed.sxm"
+        check_overwrite(inp, out)

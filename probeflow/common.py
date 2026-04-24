@@ -176,3 +176,11 @@ def mark_processed_stem(stem: str) -> str:
     if stem.endswith("_processed"):
         return stem
     return f"{stem}_processed"
+
+
+def check_overwrite(input_path: Path, output_path: Path) -> None:
+    """Raise ValueError if output_path resolves to the same file as input_path."""
+    if Path(input_path).resolve() == Path(output_path).resolve():
+        raise ValueError(
+            f"Output path would overwrite the source: {output_path!r}"
+        )
