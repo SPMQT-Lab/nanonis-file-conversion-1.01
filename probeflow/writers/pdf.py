@@ -11,6 +11,7 @@ from typing import Optional
 
 import numpy as np
 
+from probeflow.common import check_overwrite
 from probeflow.scan import Scan
 
 
@@ -50,6 +51,8 @@ def write_pdf(
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
 
+    if scan.source_path is not None:
+        check_overwrite(scan.source_path, out_path)
     if plane_idx < 0 or plane_idx >= scan.n_planes:
         raise ValueError(
             f"plane_idx={plane_idx} out of range for Scan with "

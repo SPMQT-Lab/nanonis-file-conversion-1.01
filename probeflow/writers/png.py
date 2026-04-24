@@ -7,6 +7,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
+from probeflow.common import check_overwrite
 from probeflow.processing import export_png
 from probeflow.scan import Scan
 
@@ -42,6 +43,8 @@ def write_png(
     scalebar_pos: str = "bottom-right",
 ) -> None:
     """Write a single plane of ``scan`` as a colourised PNG."""
+    if scan.source_path is not None:
+        check_overwrite(scan.source_path, out_path)
     if plane_idx < 0 or plane_idx >= scan.n_planes:
         raise ValueError(
             f"plane_idx={plane_idx} out of range for Scan with "

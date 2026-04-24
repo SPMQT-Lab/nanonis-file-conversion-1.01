@@ -61,6 +61,7 @@ def _open_url(url: str) -> None:
 
 from probeflow import processing as _proc
 from probeflow.common import mark_processed_stem
+from probeflow.gui_processing import NUMERIC_PROC_KEYS, apply_processing_state_to_scan
 from probeflow.scan import SUPPORTED_SUFFIXES, load_scan
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -4258,11 +4259,7 @@ class ProbeFlowWindow(QMainWindow):
         label      = settings["format_label"]
 
         _, _, proc_state = self._grid.get_card_state(entry.stem)
-        _ACTIVE_PROC_KEYS = (
-            "remove_bad_lines", "align_rows", "bg_order",
-            "facet_level", "smooth_sigma", "edge_method", "fft_mode",
-        )
-        has_processing = any(proc_state.get(k) for k in _ACTIVE_PROC_KEYS)
+        has_processing = any(proc_state.get(k) for k in NUMERIC_PROC_KEYS)
         out_stem = mark_processed_stem(entry.stem) if has_processing else entry.stem
         suggested = str(Path.home() / f"{out_stem}.{suffix}")
 
@@ -4270,10 +4267,16 @@ class ProbeFlowWindow(QMainWindow):
             msg = QMessageBox(self)
             msg.setWindowTitle("Save as .sxm")
             msg.setIcon(QMessageBox.Icon.Information)
-            msg.setText(
-                "The exported <b>.sxm</b> will include processing provenance "
-                "in the <tt>COMMENT</tt> header field."
-            )
+            if has_processing:
+                msg.setText(
+                    "The exported <b>.sxm</b> will include source provenance "
+                    "and processing operations in the <tt>COMMENT</tt> header field."
+                )
+            else:
+                msg.setText(
+                    "The exported <b>.sxm</b> will include source provenance "
+                    "(<tt>Source: &lt;filename&gt;</tt>) in the <tt>COMMENT</tt> header field."
+                )
             msg.setInformativeText(f"Suggested filename: <b>{out_stem}.sxm</b>")
             msg.setStandardButtons(
                 QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
@@ -4295,6 +4298,8 @@ class ProbeFlowWindow(QMainWindow):
         if scan.n_planes == 0:
             self._status_bar.showMessage("Could not read scan data")
             return
+
+        apply_processing_state_to_scan(scan, proc_state, plane_idx=0)
 
         clip_low, clip_high = self._browse_tools.get_clip_values()
         cmap_key = self._grid._card_colormaps.get(entry.stem, DEFAULT_CMAP_KEY)

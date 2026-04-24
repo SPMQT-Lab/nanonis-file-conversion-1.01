@@ -12,6 +12,8 @@ from pathlib import Path
 
 import numpy as np
 
+from probeflow.common import check_overwrite
+
 
 def write_csv(
     scan,
@@ -21,6 +23,8 @@ def write_csv(
     delimiter: str = ",",
     fmt: str = "%.6e",
 ) -> None:
+    if scan.source_path is not None:
+        check_overwrite(scan.source_path, out_path)
     if plane_idx < 0 or plane_idx >= scan.n_planes:
         raise ValueError(
             f"plane_idx={plane_idx} out of range for Scan with "

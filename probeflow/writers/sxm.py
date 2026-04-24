@@ -21,6 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
+from probeflow.common import check_overwrite
 from probeflow.scan import Scan
 from probeflow.sxm_io import write_sxm_with_planes
 
@@ -42,6 +43,8 @@ def _build_comment(scan: Scan) -> str:
 
 def write_sxm(scan: Scan, out_path) -> None:
     out_path = Path(out_path)
+    if scan.source_path is not None:
+        check_overwrite(scan.source_path, out_path)
     if scan.source_format == "sxm":
         _write_from_sxm(scan, out_path)
     elif scan.source_format == "dat":
