@@ -26,7 +26,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
     QDialog, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
     QRadioButton, QScrollArea, QSlider, QSplitter, QStackedWidget,
     QStatusBar, QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit,
     QVBoxLayout, QWidget,
@@ -4265,6 +4265,22 @@ class ProbeFlowWindow(QMainWindow):
         has_processing = any(proc_state.get(k) for k in _ACTIVE_PROC_KEYS)
         out_stem = mark_processed_stem(entry.stem) if has_processing else entry.stem
         suggested = str(Path.home() / f"{out_stem}.{suffix}")
+
+        if suffix == "sxm":
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Save as .sxm")
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.setText(
+                "The exported <b>.sxm</b> will include processing provenance "
+                "in the <tt>COMMENT</tt> header field."
+            )
+            msg.setInformativeText(f"Suggested filename: <b>{out_stem}.sxm</b>")
+            msg.setStandardButtons(
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
+            )
+            msg.setDefaultButton(QMessageBox.StandardButton.Ok)
+            if msg.exec() != QMessageBox.StandardButton.Ok:
+                return
 
         out_path, _ = QFileDialog.getSaveFileName(
             self, f"Save as {label}", suggested, filt)
