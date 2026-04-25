@@ -41,6 +41,7 @@ def write_png(
     add_scalebar: bool = True,
     scalebar_unit: str = "nm",
     scalebar_pos: str = "bottom-right",
+    provenance=None,  # ExportProvenance | None
 ) -> None:
     """Write a single plane of ``scan`` as a colourised PNG."""
     if scan.source_path is not None:
@@ -58,4 +59,5 @@ def write_png(
         add_scalebar=add_scalebar,
         scalebar_unit=scalebar_unit,
         scalebar_pos=scalebar_pos,
+        provenance=provenance,
     )

@@ -59,6 +59,20 @@ class DisplayRangeState:
 
     # ── Limit resolution ──────────────────────────────────────────────────────
 
+    def to_dict(self) -> dict:
+        """Return a JSON-compatible dictionary of the current display state.
+
+        ``vmin`` and ``vmax`` are always present (as ``None`` in percentile mode)
+        so downstream consumers can rely on a fixed key set.
+        """
+        return {
+            "mode":     self.mode,
+            "low_pct":  self.low_pct,
+            "high_pct": self.high_pct,
+            "vmin":     self.vmin,
+            "vmax":     self.vmax,
+        }
+
     def resolve(self, arr) -> tuple[float | None, float | None]:
         """Return (vmin, vmax) for rendering.
 

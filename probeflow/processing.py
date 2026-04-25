@@ -675,6 +675,7 @@ def export_png(
     scalebar_pos:  str           = 'bottom-right',
     vmin:          float | None  = None,
     vmax:          float | None  = None,
+    provenance                   = None,   # ExportProvenance | None
 ) -> None:
     """
     Export a full-resolution colourised image with an optional scale bar.
@@ -682,6 +683,7 @@ def export_png(
     lut_fn(colormap_key) must return a (256, 3) uint8 LUT array.
     scan_range_m  — (width_m, height_m); scale bar is skipped when width ≤ 0.
     If *vmin*/*vmax* are provided, they override the percentile clip.
+    If *provenance* is provided, a ``<stem>.provenance.json`` sidecar is written.
     """
     from PIL import Image as _Image, ImageDraw as _IDraw, ImageFont as _IFont
 
@@ -752,6 +754,17 @@ def export_png(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(str(out_path), format="PNG")
+
+    if provenance is not None:
+        import json as _json
+        sidecar = out_path.with_suffix("").with_suffix(".provenance.json")
+        try:
+            sidecar.write_text(
+                _json.dumps(provenance.to_dict(), indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass  # sidecar failure must never break the PNG export
 
 
 # ═════════════════════════════════════════════════════════════════════════════

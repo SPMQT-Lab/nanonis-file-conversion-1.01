@@ -2085,16 +2085,34 @@ class ImageViewerDialog(QDialog):
             return
         try:
             try:
-                w_m, h_m = load_scan(entry.path).scan_range_m
+                _scan = load_scan(entry.path)
+                w_m, h_m = _scan.scan_range_m
             except Exception:
+                _scan = None
                 w_m = h_m = 0.0
             vmin, vmax = self._drs.resolve(arr)
+            provenance = None
+            if _scan is not None:
+                try:
+                    from probeflow.export_provenance import ExportProvenance
+                    ch_idx = self._ch_cb.currentIndex()
+                    ps = processing_state_from_gui(self._processing or {})
+                    provenance = ExportProvenance.from_scan_export(
+                        _scan,
+                        channel_index=ch_idx,
+                        channel_name=PLANE_NAMES[ch_idx] if 0 <= ch_idx < len(PLANE_NAMES) else None,
+                        processing_state=ps,
+                        display_state=self._drs,
+                    )
+                except Exception:
+                    pass
             _proc.export_png(
                 arr, out_path, self._colormap,
                 self._clip_low, self._clip_high,
                 lut_fn=lambda key: _get_lut(key),
                 scan_range_m=(w_m, h_m),
                 vmin=vmin, vmax=vmax,
+                provenance=provenance,
             )
             self._status_lbl.setText(f"Saved → {Path(out_path).name}")
         except Exception as exc:

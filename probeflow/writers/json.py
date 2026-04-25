@@ -30,6 +30,7 @@ def write_json(
     kind: str,
     scan=None,
     extra_meta: Optional[dict] = None,
+    provenance=None,  # ExportProvenance | None
 ) -> None:
     """Write a list of dataclass-like objects to JSON with scan provenance.
 
@@ -48,6 +49,10 @@ def write_json(
         the ``meta`` block.
     extra_meta
         Additional metadata merged into the ``meta`` block.
+    provenance
+        Optional :class:`probeflow.export_provenance.ExportProvenance`.
+        When provided, ``export_provenance``, ``processing_state``, and
+        ``display_state`` are added as top-level keys.
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,7 +71,9 @@ def write_json(
             "plane_names": list(scan.plane_names),
             "plane_units": list(scan.plane_units),
         })
-        if scan.processing_history:
+        # Include processing history when no ExportProvenance is provided
+        # (ExportProvenance carries it at the top level via processing_state).
+        if scan.processing_history and provenance is None:
             meta["processing_state"] = {
                 "steps": [
                     {"op": h["op"], "params": h["params"]}
@@ -76,10 +83,16 @@ def write_json(
     if extra_meta:
         meta.update(extra_meta)
 
-    payload = {
-        "meta": meta,
-        "items": [it.to_dict() if hasattr(it, "to_dict") else dict(it) for it in items],
-    }
+    payload: dict = {"meta": meta}
+
+    if provenance is not None:
+        payload["export_provenance"] = provenance.to_dict()
+        payload["processing_state"]  = provenance.processing_state
+        payload["display_state"]     = provenance.display_state
+
+    payload["items"] = [
+        it.to_dict() if hasattr(it, "to_dict") else dict(it) for it in items
+    ]
 
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, default=_encode)
