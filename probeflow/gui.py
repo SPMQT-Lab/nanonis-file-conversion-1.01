@@ -251,6 +251,78 @@ def _card_meta_str(entry: SxmFile) -> str:
 
 # ── SXM parsing / plane I/O live in probeflow.sxm_io (imported above). ──────
 
+
+def clip_range_from_arr(
+    arr: Optional[np.ndarray],
+    pct_lo: float = 1.0,
+    pct_hi: float = 99.0,
+) -> tuple[Optional[float], Optional[float]]:
+    """Return (vmin, vmax) for display clipping at the given percentiles.
+
+    Guards:
+    - None / empty / all-NaN array → (None, None)
+    - Constant image or percentiles coincide → (min, max), then ±1 offset
+    - Very small arrays (< 2 finite values) → (None, None)
+    """
+    if arr is None:
+        return None, None
+    finite = arr[np.isfinite(arr)]
+    if finite.size < 2:
+        return None, None
+    lo = float(np.percentile(finite, pct_lo))
+    hi = float(np.percentile(finite, pct_hi))
+    if hi <= lo:
+        lo, hi = float(finite.min()), float(finite.max())
+    if hi <= lo:
+        lo, hi = lo - 1.0, lo + 1.0
+    return lo, hi
+
+
+def _apply_processing(
+    arr: np.ndarray,
+    processing: dict,
+) -> np.ndarray:
+    """Apply the array-transform portion of the processing pipeline.
+
+    Grain detection / colormap / clip settings are display-only and are
+    intentionally excluded here.  Returns a new float64 array; the input
+    is never modified.
+    """
+    if not processing:
+        return arr
+    a = arr.astype(np.float64, copy=True)
+    if processing.get('remove_bad_lines'):
+        a = _proc.remove_bad_lines(a)
+    align = processing.get('align_rows')
+    if align:
+        a = _proc.align_rows(a, method=align)
+    bg_order = processing.get('bg_order')
+    if bg_order is not None:
+        a = _proc.subtract_background(a, order=int(bg_order))
+    if processing.get('facet_level'):
+        a = _proc.facet_level(a)
+    smooth_sigma = processing.get('smooth_sigma')
+    if smooth_sigma:
+        a = _proc.gaussian_smooth(a, sigma_px=float(smooth_sigma))
+    edge_method = processing.get('edge_method')
+    if edge_method:
+        a = _proc.edge_detect(
+            a,
+            method=edge_method,
+            sigma=float(processing.get('edge_sigma', 1.0)),
+            sigma2=float(processing.get('edge_sigma2', 2.0)),
+        )
+    fft_mode = processing.get('fft_mode')
+    if fft_mode is not None:
+        a = _proc.fourier_filter(
+            a,
+            mode=fft_mode,
+            cutoff=float(processing.get('fft_cutoff', 0.10)),
+            window=str(processing.get('fft_window', 'hanning')),
+        )
+    return a
+
+
 def render_scan_thumbnail(
     scan_path: Path,
     plane_idx: int   = 0,
@@ -266,14 +338,8 @@ def render_scan_thumbnail(
             return None
         arr = scan.planes[plane_idx]
 
-        finite = arr[np.isfinite(arr)]
-        if finite.size == 0:
-            return None
-        vmin = float(np.percentile(finite, clip_low))
-        vmax = float(np.percentile(finite, clip_high))
-        if vmax <= vmin:
-            vmin, vmax = float(finite.min()), float(finite.max())
-        if vmax <= vmin:
+        vmin, vmax = clip_range_from_arr(arr, clip_low, clip_high)
+        if vmin is None:
             return None
 
         safe    = np.where(np.isfinite(arr), arr, vmin).astype(np.float64)
@@ -342,8 +408,7 @@ def render_with_processing(
     processing: dict,
     size:       Optional[tuple] = None,
 ) -> Optional[Image.Image]:
-    """
-    Apply the full processing pipeline to *arr* then render to a PIL Image.
+    """Apply the full processing pipeline to *arr* then render to a PIL Image.
 
     processing keys (all optional):
         remove_bad_lines : bool
@@ -363,52 +428,10 @@ def render_with_processing(
     if processing is None:
         processing = {}
     try:
-        a = arr.astype(np.float64, copy=True)
+        a = _apply_processing(arr, processing)
 
-        if processing.get('remove_bad_lines'):
-            a = _proc.remove_bad_lines(a)
-
-        align = processing.get('align_rows')
-        if align:
-            a = _proc.align_rows(a, method=align)
-
-        bg_order = processing.get('bg_order')
-        if bg_order is not None:
-            a = _proc.subtract_background(a, order=int(bg_order))
-
-        if processing.get('facet_level'):
-            a = _proc.facet_level(a)
-
-        smooth_sigma = processing.get('smooth_sigma')
-        if smooth_sigma:
-            a = _proc.gaussian_smooth(a, sigma_px=float(smooth_sigma))
-
-        edge_method = processing.get('edge_method')
-        if edge_method:
-            a = _proc.edge_detect(
-                a,
-                method=edge_method,
-                sigma=float(processing.get('edge_sigma', 1.0)),
-                sigma2=float(processing.get('edge_sigma2', 2.0)),
-            )
-
-        fft_mode = processing.get('fft_mode')
-        if fft_mode is not None:
-            a = _proc.fourier_filter(
-                a,
-                mode=fft_mode,
-                cutoff=float(processing.get('fft_cutoff', 0.10)),
-                window=str(processing.get('fft_window', 'hanning')),
-            )
-
-        finite = a[np.isfinite(a)]
-        if finite.size == 0:
-            return None
-        vmin = float(np.percentile(finite, clip_low))
-        vmax = float(np.percentile(finite, clip_high))
-        if vmax <= vmin:
-            vmin, vmax = float(finite.min()), float(finite.max())
-        if vmax <= vmin:
+        vmin, vmax = clip_range_from_arr(a, clip_low, clip_high)
+        if vmin is None:
             return None
 
         # Grain overlay: colour-code labelled regions on top of the image
@@ -1485,7 +1508,8 @@ class ImageViewerDialog(QDialog):
         self._clip_low   = clip_low
         self._clip_high  = clip_high
         self._processing = dict(processing) if processing else {}
-        self._raw_arr: Optional[np.ndarray] = None  # for histogram
+        self._raw_arr: Optional[np.ndarray] = None
+        self._display_arr: Optional[np.ndarray] = None  # raw or processed, for histogram/export
         self._spec_markers: list[dict] = []
         self._scan_header: dict = {}
         self._scan_range_m: Optional[tuple] = None
@@ -1811,7 +1835,7 @@ class ImageViewerDialog(QDialog):
         self._zoom_lbl.setText("Loading…")
         self._zoom_lbl.setPixmap(QPixmap())
         self._zoom_lbl.set_markers([])
-        # load raw array for histogram and capture scan geometry for spec overlay
+        # load raw array; compute display array (with processing if active)
         try:
             _scan = load_scan(entry.path)
             idx = self._ch_cb.currentIndex()
@@ -1826,6 +1850,14 @@ class ImageViewerDialog(QDialog):
             self._scan_range_m = None
             self._scan_shape   = None
             self._scan_format  = ""
+        # display array: raw with processing applied (no grain overlay — that's visual only)
+        if self._raw_arr is not None and self._processing:
+            try:
+                self._display_arr = _apply_processing(self._raw_arr, self._processing)
+            except Exception:
+                self._display_arr = self._raw_arr
+        else:
+            self._display_arr = self._raw_arr
         self._update_histogram()
         self._load_spec_markers(entry)
         # load rendered image
@@ -1846,7 +1878,8 @@ class ImageViewerDialog(QDialog):
         return 1e12, "pA", "Current"
 
     def _update_histogram(self):
-        arr = self._raw_arr
+        # Use processed display array so histogram tracks what the user sees
+        arr = self._display_arr
         self._ax.cla()
         self._low_line  = None
         self._high_line = None
@@ -1857,7 +1890,7 @@ class ImageViewerDialog(QDialog):
             return
 
         flat = arr[np.isfinite(arr)].ravel()
-        if flat.size == 0:
+        if flat.size < 2:
             self._canvas.draw_idle()
             return
 
@@ -1866,15 +1899,31 @@ class ImageViewerDialog(QDialog):
         self._hist_flat_phys = flat_phys
         self._hist_unit = unit
 
-        lo_phys = float(np.percentile(flat_phys, self._clip_low))
-        hi_phys = float(np.percentile(flat_phys, self._clip_high))
+        # Robust x-axis range (0.1–99.9 %): suppresses outlier spikes and
+        # sets the histogram bin range so bins are distributed over the
+        # useful signal, not stretched over a single extreme pixel.
+        x_min = x_max = None
+        if flat_phys.size >= 10:
+            x_min = float(np.percentile(flat_phys, 0.1))
+            x_max = float(np.percentile(flat_phys, 99.9))
+            if not (np.isfinite(x_min) and np.isfinite(x_max) and x_max > x_min):
+                x_min = x_max = None
+
+        # Clip lines: percentiles applied to flat_phys (already in display units)
+        lo_phys, hi_phys = clip_range_from_arr(flat_phys, self._clip_low, self._clip_high)
+        if lo_phys is None:
+            lo_phys, hi_phys = float(flat_phys.min()), float(flat_phys.max())
 
         bg = self._t.get("bg", "#1e1e2e")
         fg = self._t.get("fg", "#cdd6f4")
         self._fig.patch.set_facecolor(bg)
         self._ax.set_facecolor(bg)
 
-        counts, edges = np.histogram(flat_phys, bins=128)
+        # Bin only over the robust display range so bars represent useful signal
+        hist_kw = {"bins": 128}
+        if x_min is not None:
+            hist_kw["range"] = (x_min, x_max)
+        counts, edges = np.histogram(flat_phys, **hist_kw)
         counts = np.maximum(counts, 1)
         centers = (edges[:-1] + edges[1:]) / 2.0
         widths = np.diff(edges)
@@ -1882,12 +1931,8 @@ class ImageViewerDialog(QDialog):
                      color=self._t.get("accent_bg", "#89b4fa"),
                      alpha=0.85, linewidth=0)
         self._ax.set_yscale("log")
-        # Robust x-axis: 0.1–99.9th percentile to suppress outlier spikes
-        if flat_phys.size >= 10:
-            x_min = float(np.percentile(flat_phys, 0.1))
-            x_max = float(np.percentile(flat_phys, 99.9))
-            if np.isfinite(x_min) and np.isfinite(x_max) and x_max > x_min:
-                self._ax.set_xlim(x_min, x_max)
+        if x_min is not None:
+            self._ax.set_xlim(x_min, x_max)
         self._low_line  = self._ax.axvline(lo_phys, color="#f38ba8",
                                             linewidth=1.6, picker=6)
         self._high_line = self._ax.axvline(hi_phys, color="#a6e3a1",
@@ -2085,7 +2130,8 @@ class ImageViewerDialog(QDialog):
             "PNG images (*.png)")
         if not out_path:
             return
-        arr = self._raw_arr
+        # Save the same array the viewer is displaying (processed if active)
+        arr = self._display_arr if self._display_arr is not None else self._raw_arr
         if arr is None:
             self._status_lbl.setText("No data to save.")
             return
@@ -4637,7 +4683,9 @@ class ProbeFlowWindow(QMainWindow):
         else:
             cmap_key, clip, proc = self._grid.get_card_state(entry.stem)
             if entry.stem not in self._grid._card_clip:
-                clip = self._browse_tools.get_clip_values()
+                # Always open new images with robust 1%–99% clip, independent
+                # of whatever the browse-tool scale sliders are set to.
+                clip = (1.0, 99.0)
             sxm_entries = [e for e in self._grid.get_entries() if isinstance(e, SxmFile)]
             dlg = ImageViewerDialog(entry, sxm_entries, cmap_key, t, self,
                                     clip_low=clip[0], clip_high=clip[1],
