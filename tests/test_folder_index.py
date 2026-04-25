@@ -16,7 +16,7 @@ _CREATEC_TERRACE = TESTDATA / "createc_scan_terrace_109nm.dat"
 _NANONIS_SXM     = TESTDATA / "sxm_moire_10nm.sxm"
 _CREATEC_VERT    = TESTDATA / "createc_ivt_telegraph_300mv_a.VERT"
 
-_CREATEC_SCAN_SHAPES = {(330, 511), (512, 511)}
+_CREATEC_SCAN_SHAPES = {(64, 63), (256, 255), (330, 511), (512, 511), (1024, 1023)}
 
 
 # ── Test A: Createc scan fixtures ─────────────────────────────────────────────
@@ -25,7 +25,7 @@ class TestCreatecScans:
     def test_createc_scans_present(self):
         items = index_folder(TESTDATA)
         dat_items = [it for it in items if it.source_format == "createc_dat"]
-        assert len(dat_items) == 2
+        assert len(dat_items) == 12
 
     def test_item_type_is_scan(self):
         items = index_folder(TESTDATA)
