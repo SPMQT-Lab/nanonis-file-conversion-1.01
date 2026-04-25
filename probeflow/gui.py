@@ -464,131 +464,78 @@ def render_with_processing(
         return None
 
 
-def scan_image_folder(root: Path) -> list[SxmFile]:
-    """Find all supported scan files under root, in format preference order.
+def _scan_items_to_sxm(items) -> list[SxmFile]:
+    """Convert ProbeFlowItem scan entries to SxmFile for the existing GUI.
 
-    Iterates over :data:`SUPPORTED_SUFFIXES` in order so that when multiple
-    formats share a stem (e.g. the same scan exported as both .sxm and .dat),
-    the earlier format wins. Globbing is case-insensitive (also matches .DAT
-    etc.). Best-effort metadata extraction is format-specific.
+    Preserves the stem-deduplication behaviour of the old scan_image_folder:
+    if two files share a stem, only the first (by index_folder sort order)
+    is kept.
     """
-    root = Path(root)
-    by_stem: dict[str, SxmFile] = {}
-    ordered: list[SxmFile] = []
+    _fmt = {"createc_dat": "dat", "nanonis_sxm": "sxm"}
+    seen: set[str] = set()
+    result: list[SxmFile] = []
+    for item in items:
+        if item.item_type != "scan" or item.path.stem in seen:
+            continue
+        seen.add(item.path.stem)
+        src_fmt = _fmt.get(item.source_format, item.source_format)
+        if item.load_error or item.shape is None:
+            result.append(SxmFile(path=item.path, stem=item.path.stem, source_format=src_fmt))
+        else:
+            Ny, Nx = item.shape
+            result.append(SxmFile(
+                path=item.path, stem=item.path.stem,
+                Nx=Nx, Ny=Ny,
+                bias_mv=item.bias * 1000 if item.bias is not None else None,
+                current_pa=item.setpoint * 1e12 if item.setpoint is not None else None,
+                scan_nm=item.scan_range[0] * 1e9 if item.scan_range else None,
+                source_format=src_fmt,
+            ))
+    return result
 
-    for suffix in SUPPORTED_SUFFIXES:
-        # Case-insensitive: lowercase and uppercase variants.
-        matches: set[Path] = set()
-        matches.update(root.rglob(f"*{suffix}"))
-        matches.update(root.rglob(f"*{suffix.upper()}"))
 
-        for p in sorted(matches):
-            if p.stem in by_stem:
-                continue
-            # Skip spectroscopy files that share the .dat extension with image files
-            from probeflow.file_type import FileType, sniff_file_type
-            ft = sniff_file_type(p)
-            if ft in (FileType.CREATEC_SPEC, FileType.NANONIS_SPEC):
-                continue
-            try:
-                scan = load_scan(p)
-                Nx, Ny = scan.dims
-                hdr = scan.header
-                src_fmt = scan.source_format
+def _spec_items_to_vert(items) -> list[VertFile]:
+    """Convert ProbeFlowItem spectrum entries to VertFile for the existing GUI."""
+    result: list[VertFile] = []
+    for item in items:
+        if item.item_type != "spectrum":
+            continue
+        if item.load_error:
+            result.append(VertFile(path=item.path, stem=item.path.stem))
+        else:
+            result.append(VertFile(
+                path=item.path,
+                stem=item.path.stem,
+                sweep_type=str(item.metadata.get("sweep_type") or "unknown"),
+                n_points=int(item.metadata.get("n_points") or 0),
+                bias_mv=item.bias * 1000 if item.bias is not None else None,
+                spec_freq_hz=item.metadata.get("spec_freq_hz"),
+            ))
+    return result
 
-                bias_mv: Optional[float]    = None
-                current_pa: Optional[float] = None
-                scan_nm: Optional[float]    = None
 
-                if src_fmt == "sxm":
-                    nums = [float(x) for x in _re.findall(
-                        r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?",
-                        hdr.get("BIAS", ""))]
-                    if nums:
-                        bias_mv = nums[0] * 1000  # V → mV
+def scan_image_folder(root: Path) -> list[SxmFile]:
+    """Find all supported scan files under root and return lightweight SxmFile entries.
 
-                    sp = _re.search(
-                        r"([-+]?\d+(?:\.\d+)?[eE][-+]?\d+)\s*A",
-                        hdr.get("Z-CONTROLLER", ""))
-                    if sp:
-                        current_pa = float(sp.group(1)) * 1e12  # A → pA
-
-                    rnums = [float(x) for x in _re.findall(
-                        r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?",
-                        hdr.get("SCAN_RANGE", ""))]
-                    if rnums:
-                        scan_nm = rnums[0] * 1e9  # m → nm
-                elif src_fmt == "dat":
-                    try:
-                        bv = hdr.get("Biasvolt[mV]")
-                        if bv is not None:
-                            bias_mv = float(bv)
-                    except (TypeError, ValueError):
-                        pass
-                    try:
-                        lx = hdr.get("Length x[A]")
-                        if lx is not None:
-                            scan_nm = float(lx) * 1e-10 / 1e-9  # Å → nm
-                    except (TypeError, ValueError):
-                        pass
-                else:
-                    # Other formats: fall back to scan_range_m if available.
-                    try:
-                        w_m = scan.scan_range_m[0]
-                        if w_m and w_m > 0:
-                            scan_nm = w_m * 1e9
-                    except Exception:
-                        pass
-
-                entry = SxmFile(
-                    path=p, stem=p.stem, Nx=Nx, Ny=Ny,
-                    bias_mv=bias_mv, current_pa=current_pa,
-                    scan_nm=scan_nm, source_format=src_fmt,
-                )
-            except Exception:
-                entry = SxmFile(
-                    path=p, stem=p.stem,
-                    source_format=p.suffix.lower().lstrip("."),
-                )
-
-            by_stem[p.stem] = entry
-            ordered.append(entry)
-
-    return ordered
+    Delegates to :func:`~probeflow.indexing.index_folder` for discovery and
+    sniffing, then converts the resulting :class:`~probeflow.indexing.ProbeFlowItem`
+    objects to the GUI-internal :class:`SxmFile` type.
+    """
+    from probeflow.indexing import index_folder
+    items = index_folder(Path(root), recursive=True, include_errors=True)
+    return _scan_items_to_sxm(items)
 
 
 def scan_vert_folder(root: Path) -> list[VertFile]:
-    """Find all spectroscopy files under root and return lightweight metadata.
+    """Find all spectroscopy files under root and return lightweight VertFile entries.
 
-    Picks up both Createc ``.VERT`` files and Nanonis ``.dat`` spec files by
-    sniffing each file's content signature.
+    Delegates to :func:`~probeflow.indexing.index_folder` for discovery and
+    sniffing, then converts the resulting :class:`~probeflow.indexing.ProbeFlowItem`
+    objects to the GUI-internal :class:`VertFile` type.
     """
-    from .file_type import FileType, sniff_file_type
-    from .spec_io import read_spec_file
-
-    entries: list[VertFile] = []
-    spec_types = (FileType.CREATEC_SPEC, FileType.NANONIS_SPEC)
-    candidates: list[Path] = []
-    for f in sorted(Path(root).rglob("*")):
-        if not f.is_file():
-            continue
-        if sniff_file_type(f) in spec_types:
-            candidates.append(f)
-
-    for vert in candidates:
-        try:
-            spec = read_spec_file(vert)
-            entries.append(VertFile(
-                path=vert,
-                stem=vert.stem,
-                sweep_type=spec.metadata["sweep_type"],
-                n_points=spec.metadata["n_points"],
-                bias_mv=spec.metadata.get("bias_mv"),
-                spec_freq_hz=spec.metadata.get("spec_freq_hz"),
-            ))
-        except Exception:
-            entries.append(VertFile(path=vert, stem=vert.stem))
-    return entries
+    from probeflow.indexing import index_folder
+    items = index_folder(Path(root), recursive=True, include_errors=True)
+    return _spec_items_to_vert(items)
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -4279,8 +4226,11 @@ class ProbeFlowWindow(QMainWindow):
         if not d:
             return
         self._switch_mode("browse")
-        sxm_entries  = scan_image_folder(Path(d))
-        vert_entries = scan_vert_folder(Path(d))
+        from probeflow.indexing import index_folder
+        all_items    = index_folder(Path(d), recursive=True, include_errors=True)
+        sxm_entries  = _scan_items_to_sxm(all_items)
+        vert_entries = _spec_items_to_vert(all_items)
+        n_errors     = sum(1 for it in all_items if it.load_error)
         entries = sorted(sxm_entries + vert_entries, key=lambda e: e.stem)
         self._grid.load(entries, folder_path=d)
         self._n_loaded = len(entries)
@@ -4291,6 +4241,8 @@ class ProbeFlowWindow(QMainWindow):
             parts.append(f"{n_sxm} scan{'s' if n_sxm != 1 else ''}")
         if n_vert:
             parts.append(f"{n_vert} spec{'s' if n_vert != 1 else ''}")
+        if n_errors:
+            parts.append(f"{n_errors} error{'s' if n_errors != 1 else ''}")
         desc = ", ".join(parts) if parts else "0 files"
         self._status_bar.showMessage(
             f"Loaded {desc} — Double-click to view  |  "

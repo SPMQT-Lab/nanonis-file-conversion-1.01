@@ -205,6 +205,8 @@ def _item_from_spec(
         "sweep_type": spec.metadata.get("sweep_type"),
         "n_points": n_pts,
         "position_m": spec.position,
+        "spec_freq_hz": _f(spec.metadata.get("spec_freq_hz")),
+        "bias_mv": _f(spec.metadata.get("bias_mv")),
     }
     return ProbeFlowItem(
         path=path,
@@ -219,3 +221,24 @@ def _item_from_spec(
         size_bytes=size_bytes,
         metadata=extra,
     )
+
+
+# ── Pure filtering helpers (testable without Qt) ─────────────────────────────
+
+def split_indexed_items(
+    items: list[ProbeFlowItem],
+) -> tuple[list[ProbeFlowItem], list[ProbeFlowItem], list[ProbeFlowItem]]:
+    """Split items into (scans, spectra, errors) for the GUI or CLI.
+
+    Errored items are excluded from scans and spectra regardless of their
+    item_type, so callers can ignore them by default or handle them separately.
+    """
+    scans   = [it for it in items if it.item_type == "scan"     and not it.load_error]
+    spectra = [it for it in items if it.item_type == "spectrum" and not it.load_error]
+    errors  = [it for it in items if it.load_error]
+    return scans, spectra, errors
+
+
+def image_browser_items(items: list[ProbeFlowItem]) -> list[ProbeFlowItem]:
+    """Return only non-errored scan items — what the image browser should show."""
+    return [it for it in items if it.item_type == "scan" and not it.load_error]
