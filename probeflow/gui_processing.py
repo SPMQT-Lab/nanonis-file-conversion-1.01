@@ -18,10 +18,14 @@ NUMERIC_PROC_KEYS: tuple[str, ...] = (
     "remove_bad_lines",
     "align_rows",
     "bg_order",
+    "bg_step_tolerance",
     "facet_level",
     "smooth_sigma",
     "edge_method",
     "fft_mode",
+    "fft_soft_border",
+    "linear_undistort",
+    "set_zero_xy",
 )
 
 
@@ -47,7 +51,10 @@ def processing_state_from_gui(gui_state: dict) -> "ProcessingState":
 
     bg_order = gui_state.get("bg_order")
     if bg_order is not None:
-        steps.append(ProcessingStep("plane_bg", {"order": int(bg_order)}))
+        steps.append(ProcessingStep("plane_bg", {
+            "order": int(bg_order),
+            "step_tolerance": bool(gui_state.get("bg_step_tolerance", False)),
+        }))
 
     if gui_state.get("facet_level"):
         steps.append(ProcessingStep("facet_level", {"threshold_deg": 3.0}))
@@ -71,6 +78,34 @@ def processing_state_from_gui(gui_state: dict) -> "ProcessingState":
             "cutoff": float(gui_state.get("fft_cutoff", 0.10)),
             "window": str(gui_state.get("fft_window",   "hanning")),
         }))
+
+    if gui_state.get("fft_soft_border"):
+        steps.append(ProcessingStep("fft_soft_border", {
+            "mode":        str(gui_state.get("fft_soft_mode",        "low_pass")),
+            "cutoff":      float(gui_state.get("fft_soft_cutoff",      0.10)),
+            "border_frac": float(gui_state.get("fft_soft_border_frac", 0.12)),
+        }))
+
+    if gui_state.get("linear_undistort"):
+        shear_x = float(gui_state.get("undistort_shear_x", 0.0))
+        scale_y = float(gui_state.get("undistort_scale_y", 1.0))
+        if shear_x != 0.0 or scale_y != 1.0:
+            steps.append(ProcessingStep("linear_undistort", {
+                "shear_x": shear_x,
+                "scale_y": scale_y,
+            }))
+
+    set_zero = gui_state.get("set_zero_xy")
+    if set_zero is not None:
+        try:
+            x_px, y_px = int(set_zero[0]), int(set_zero[1])
+            steps.append(ProcessingStep("set_zero_point", {
+                "x_px":  x_px,
+                "y_px":  y_px,
+                "patch": int(gui_state.get("set_zero_patch", 1)),
+            }))
+        except (TypeError, ValueError, IndexError):
+            pass
 
     return ProcessingState(steps=steps)
 

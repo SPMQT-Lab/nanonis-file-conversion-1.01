@@ -148,7 +148,7 @@ class TestApplyProcessingStateSingleOp:
         apply_processing_state_to_scan(scan, {"bg_order": 2})
         entry = scan.processing_history[0]
         assert entry["op"] == "plane_bg"
-        assert entry["params"] == {"order": 2}
+        assert entry["params"] == {"order": 2, "step_tolerance": False}
         assert "timestamp" in entry
 
     def test_align_rows_appends_entry(self):

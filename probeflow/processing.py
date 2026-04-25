@@ -101,7 +101,13 @@ def _poly_terms(x: np.ndarray, y: np.ndarray, order: int) -> np.ndarray:
     return np.column_stack(cols)
 
 
-def subtract_background(arr: np.ndarray, order: int = 1) -> np.ndarray:
+def subtract_background(
+    arr: np.ndarray,
+    order: int = 1,
+    *,
+    step_tolerance: bool = False,
+    step_threshold_deg: float = 3.0,
+) -> np.ndarray:
     """Fit and subtract a 2D polynomial background from an image.
 
     Parameters
@@ -109,14 +115,18 @@ def subtract_background(arr: np.ndarray, order: int = 1) -> np.ndarray:
     arr:
         2D image array.
     order:
-        Total polynomial order.  Supported values are 1, 2, 3, and 4.
-        order=1 fits a plane (3 terms), order=2 fits a quadratic surface
-        (6 terms), order=3 fits cubic (10 terms), order=4 fits quartic
-        (15 terms).
+        Total polynomial order. Supported values are 1, 2, 3, 4.
+    step_tolerance:
+        When True, ImageJ-style step-edge masking — pixels whose finite-
+        difference gradient exceeds ``tan(step_threshold_deg)`` are excluded
+        from the fit so terraces dominate. Falls back to a full-pixel fit
+        when fewer than ``n_terms`` pixels remain after masking.
+    step_threshold_deg:
+        Slope angle (degrees) above which a pixel is treated as a step edge.
 
-    Coordinates are normalised to [-1, 1] for numerical stability.
-    Only finite pixels participate in the least-squares fit.
-    NaNs in the input are preserved in the output.
+    Coordinates are normalised to [-1, 1] for numerical stability. Only
+    finite pixels participate in the least-squares fit. NaNs in the input
+    are preserved in the output.
     """
     if order < 1 or order > 4:
         raise ValueError(f"order must be 1..4, got {order}")
@@ -137,8 +147,17 @@ def subtract_background(arr: np.ndarray, order: int = 1) -> np.ndarray:
     if finite.sum() < n_terms:
         return arr
 
-    A = _poly_terms(flat_x[finite], flat_y[finite], order)
-    b = flat_z[finite]
+    fit_mask = finite
+    if step_tolerance and Ny >= 3 and Nx >= 3:
+        gy, gx = np.gradient(np.where(np.isfinite(arr), arr, 0.0))
+        slope_mag = np.sqrt(gx ** 2 + gy ** 2).ravel()
+        tan_thresh = math.tan(math.radians(step_threshold_deg))
+        candidate = finite & (slope_mag < tan_thresh)
+        if candidate.sum() >= n_terms:
+            fit_mask = candidate
+
+    A = _poly_terms(flat_x[fit_mask], flat_y[fit_mask], order)
+    b = flat_z[fit_mask]
     coeffs, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
 
     bg = (_poly_terms(flat_x, flat_y, order) @ coeffs).reshape(Ny, Nx)
@@ -999,3 +1018,248 @@ def line_profile(
     seg_len_m = float(np.hypot(dx_m, dy_m))
     s_m = ts * seg_len_m
     return s_m, z.astype(arr.dtype, copy=False)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 14.  set_zero_point  (Gwyddion-style "Set Z=0 here")
+# ═════════════════════════════════════════════════════════════════════════════
+
+def set_zero_point(
+    arr: np.ndarray,
+    y_px: int,
+    x_px: int,
+    *,
+    patch: int = 1,
+) -> np.ndarray:
+    """Subtract the mean of a small patch around ``(y_px, x_px)`` from the image.
+
+    Parameters
+    ----------
+    arr
+        2-D scan plane.
+    y_px, x_px
+        Pixel coordinates of the click. Coordinates outside the array are
+        clipped to the nearest edge pixel.
+    patch
+        Half-size of the averaging window in pixels. ``patch=1`` averages a
+        3×3 region (the default; matches Gwyddion's "Z=0 at pixel"). Use 0 to
+        sample a single pixel.
+    """
+    if arr.ndim != 2:
+        raise ValueError("set_zero_point expects a 2-D array")
+    Ny, Nx = arr.shape
+    y = max(0, min(int(y_px), Ny - 1))
+    x = max(0, min(int(x_px), Nx - 1))
+    p = max(0, int(patch))
+    y0, y1 = max(0, y - p), min(Ny, y + p + 1)
+    x0, x1 = max(0, x - p), min(Nx, x + p + 1)
+    region = arr[y0:y1, x0:x1]
+    finite = region[np.isfinite(region)]
+    if finite.size == 0:
+        return arr.astype(np.float64, copy=True)
+    ref = float(finite.mean())
+    return arr.astype(np.float64, copy=True) - ref
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 15.  fft_soft_border  (ImageJ FFT_Soft_Border port)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def fft_soft_border(
+    arr: np.ndarray,
+    *,
+    mode: str = "low_pass",
+    cutoff: float = 0.1,
+    border_frac: float = 0.12,
+) -> np.ndarray:
+    """FFT filter with a Tukey-tapered border to suppress wrap-around ringing.
+
+    Pixels within ``border_frac`` of any edge are smoothly tapered to the
+    image mean before transforming, so the periodic continuation used by the
+    DFT no longer carries a discontinuity. The taper is undone after the
+    inverse transform so the interior is preserved.
+
+    Parameters
+    ----------
+    arr
+        2-D image.
+    mode
+        ``"low_pass"`` keeps frequencies inside ``cutoff``; ``"high_pass"``
+        keeps frequencies outside.
+    cutoff
+        Radial frequency cut-off in fraction of Nyquist [0, 1].
+    border_frac
+        Fraction of each side over which the Tukey window ramps up.
+    """
+    if arr.ndim != 2:
+        raise ValueError("fft_soft_border expects a 2-D array")
+    if not 0.0 < border_frac < 0.5:
+        raise ValueError("border_frac must be in (0, 0.5)")
+
+    a = arr.astype(np.float64, copy=True)
+    Ny, Nx = a.shape
+    nan_mask = ~np.isfinite(a)
+    mean_val = float(np.nanmean(a)) if (~nan_mask).any() else 0.0
+    a[nan_mask] = mean_val
+
+    def _tukey(n: int, frac: float) -> np.ndarray:
+        w = np.ones(n)
+        edge = max(1, int(round(frac * n)))
+        ramp = 0.5 * (1.0 - np.cos(np.linspace(0.0, math.pi, edge)))
+        w[:edge] = ramp
+        w[-edge:] = ramp[::-1]
+        return w
+
+    wy = _tukey(Ny, border_frac)
+    wx = _tukey(Nx, border_frac)
+    win2d = np.outer(wy, wx)
+
+    centered = a - mean_val
+    tapered = centered * win2d
+
+    F = np.fft.fftshift(np.fft.fft2(tapered))
+    cy, cx = Ny / 2.0, Nx / 2.0
+    yr = (np.arange(Ny) - cy) / max(cy, 1e-9)
+    xr = (np.arange(Nx) - cx) / max(cx, 1e-9)
+    Xr, Yr = np.meshgrid(xr, yr)
+    R = np.sqrt(Xr ** 2 + Yr ** 2)
+    if mode == "low_pass":
+        mask = (R <= cutoff).astype(np.float64)
+    elif mode == "high_pass":
+        mask = (R >= cutoff).astype(np.float64)
+    else:
+        raise ValueError(f"Unknown mode: {mode!r}")
+
+    out = np.fft.ifft2(np.fft.ifftshift(F * mask)).real
+    safe_win = np.where(win2d > 1e-6, win2d, 1.0)
+    out = out / safe_win + mean_val
+    out[nan_mask] = np.nan
+    return out
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 16.  patch_interpolate  (ImageJ Patch_Interpolation port)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def patch_interpolate(
+    arr: np.ndarray,
+    mask: np.ndarray,
+    *,
+    iterations: int = 200,
+) -> np.ndarray:
+    """Fill masked pixels by Jacobi-iteration of the discrete Laplace equation.
+
+    Useful for hiding scan artefacts (tip jumps, single-line glitches) without
+    biasing later FFT/correlation analyses.
+
+    Parameters
+    ----------
+    arr
+        2-D image.
+    mask
+        Boolean array; True for pixels to interpolate.
+    iterations
+        Number of relaxation passes. 100–400 is normally enough.
+    """
+    if arr.shape != mask.shape:
+        raise ValueError("arr and mask must have the same shape")
+    a = arr.astype(np.float64, copy=True)
+    m = mask.astype(bool)
+    if not m.any():
+        return a
+
+    fill = float(np.nanmean(a[~m & np.isfinite(a)])) if (~m).any() else 0.0
+    a[m | ~np.isfinite(a)] = fill
+    Ny, Nx = a.shape
+    for _ in range(max(1, int(iterations))):
+        nb = np.zeros_like(a)
+        nb[1:-1, 1:-1] = 0.25 * (
+            a[:-2, 1:-1] + a[2:, 1:-1] + a[1:-1, :-2] + a[1:-1, 2:]
+        )
+        nb[0, :] = a[0, :]
+        nb[-1, :] = a[-1, :]
+        nb[:, 0] = a[:, 0]
+        nb[:, -1] = a[:, -1]
+        a = np.where(m, nb, a)
+    return a
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 17.  linear_undistort  (ImageJ Linear_Undistort port)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def linear_undistort(
+    arr: np.ndarray,
+    *,
+    shear_x: float = 0.0,
+    scale_y: float = 1.0,
+) -> np.ndarray:
+    """Apply an affine drift/creep correction to a scan plane.
+
+    The forward map shifts column ``c`` by ``shear_x * (row / Ny)`` pixels and
+    rescales the row coordinate by ``scale_y``. Inverse-mapped via
+    ``scipy.ndimage.map_coordinates`` so every output pixel comes from one
+    bilinearly-interpolated location in the input.
+
+    Parameters
+    ----------
+    arr
+        2-D image.
+    shear_x
+        Total horizontal drift across the slow-scan axis, in pixels (so
+        ``shear_x = 5`` means the bottom row is sheared 5 px to the right).
+    scale_y
+        Multiplicative scaling of the slow-scan axis (1.0 = no change).
+    """
+    from scipy.ndimage import map_coordinates
+
+    if arr.ndim != 2:
+        raise ValueError("linear_undistort expects a 2-D array")
+    if scale_y <= 0:
+        raise ValueError("scale_y must be > 0")
+    a = arr.astype(np.float64, copy=True)
+    nan_mask = ~np.isfinite(a)
+    if nan_mask.any():
+        a[nan_mask] = float(np.nanmean(a))
+    Ny, Nx = a.shape
+    yy, xx = np.indices(a.shape).astype(np.float64)
+    src_y = yy / max(scale_y, 1e-9)
+    src_x = xx - shear_x * (yy / max(Ny - 1, 1))
+    out = map_coordinates(
+        a, np.vstack([src_y.ravel(), src_x.ravel()]),
+        order=1, mode="reflect",
+    ).reshape(Ny, Nx)
+    return out
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 18.  blend_forward_backward  (ImageJ Blend_Images port)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def blend_forward_backward(
+    fwd: np.ndarray,
+    bwd: np.ndarray,
+    *,
+    weight: float = 0.5,
+) -> np.ndarray:
+    """Blend a forward-scan plane with a horizontally-mirrored backward plane.
+
+    Parameters
+    ----------
+    fwd, bwd
+        2-D arrays of the same shape. ``bwd`` is left-right flipped before
+        blending so the same physical location overlaps in both planes.
+    weight
+        Weight of the forward plane in [0, 1]. ``0.5`` is a symmetric mean.
+    """
+    if fwd.shape != bwd.shape:
+        raise ValueError("fwd and bwd must have the same shape")
+    if not 0.0 <= weight <= 1.0:
+        raise ValueError("weight must be in [0, 1]")
+    f = fwd.astype(np.float64, copy=True)
+    b = np.fliplr(bwd.astype(np.float64, copy=True))
+    out = weight * f + (1.0 - weight) * b
+    nan_mask = ~np.isfinite(f) | ~np.isfinite(b)
+    if nan_mask.any():
+        out[nan_mask] = np.where(np.isfinite(f), f, b)[nan_mask]
+    return out

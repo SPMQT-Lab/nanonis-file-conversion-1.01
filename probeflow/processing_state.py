@@ -32,6 +32,9 @@ _SUPPORTED_OPS: frozenset[str] = frozenset({
     "smooth",
     "edge_detect",
     "fourier_filter",
+    "fft_soft_border",
+    "linear_undistort",
+    "set_zero_point",
 })
 
 
@@ -125,7 +128,11 @@ def apply_processing_state(arr: np.ndarray, state: ProcessingState) -> np.ndarra
         elif step.op == "align_rows":
             a = _proc.align_rows(a, method=p.get("method", "median"))
         elif step.op == "plane_bg":
-            a = _proc.subtract_background(a, order=int(p.get("order", 1)))
+            a = _proc.subtract_background(
+                a,
+                order=int(p.get("order", 1)),
+                step_tolerance=bool(p.get("step_tolerance", False)),
+            )
         elif step.op == "facet_level":
             a = _proc.facet_level(a)
         elif step.op == "smooth":
@@ -143,6 +150,26 @@ def apply_processing_state(arr: np.ndarray, state: ProcessingState) -> np.ndarra
                 mode=p.get("mode", "low_pass"),
                 cutoff=float(p.get("cutoff", 0.10)),
                 window=str(p.get("window", "hanning")),
+            )
+        elif step.op == "fft_soft_border":
+            a = _proc.fft_soft_border(
+                a,
+                mode=str(p.get("mode", "low_pass")),
+                cutoff=float(p.get("cutoff", 0.10)),
+                border_frac=float(p.get("border_frac", 0.12)),
+            )
+        elif step.op == "linear_undistort":
+            a = _proc.linear_undistort(
+                a,
+                shear_x=float(p.get("shear_x", 0.0)),
+                scale_y=float(p.get("scale_y", 1.0)),
+            )
+        elif step.op == "set_zero_point":
+            a = _proc.set_zero_point(
+                a,
+                int(p.get("y_px", 0)),
+                int(p.get("x_px", 0)),
+                patch=int(p.get("patch", 1)),
             )
         else:
             raise ValueError(

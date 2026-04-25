@@ -26,7 +26,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
-    QDialog, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
+    QDialog, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
     QRadioButton, QScrollArea, QSlider, QSplitter, QStackedWidget,
     QStatusBar, QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit,
@@ -1316,6 +1316,7 @@ class _ZoomLabel(QLabel):
     """QLabel inside a scroll area that supports Ctrl+Wheel zoom and spec-position markers."""
 
     marker_clicked = Signal(object)  # emits VertFile when user clicks a marker
+    pixel_clicked  = Signal(float, float)  # (frac_x, frac_y) — only when set_zero_mode is on
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1324,7 +1325,12 @@ class _ZoomLabel(QLabel):
         self._zoom = 1.0
         self._markers: list[dict] = []   # each: {frac_x, frac_y, entry}
         self._show_markers: bool = True
+        self._set_zero_mode: bool = False
         self.setMouseTracking(True)
+
+    def set_set_zero_mode(self, enabled: bool):
+        self._set_zero_mode = bool(enabled)
+        self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
 
     def set_source(self, pixmap: QPixmap):
         self._pixmap_orig = pixmap
@@ -1406,6 +1412,14 @@ class _ZoomLabel(QLabel):
                 if abs(pos.x() - sx) <= 12 and abs(pos.y() - sy) <= 12:
                     self.marker_clicked.emit(m["entry"])
                     return
+        if (event.button() == Qt.LeftButton and self._set_zero_mode
+                and self._pixmap_orig is not None
+                and self.width() > 0 and self.height() > 0):
+            pos = event.pos()
+            fx = max(0.0, min(1.0, pos.x() / float(self.width())))
+            fy = max(0.0, min(1.0, pos.y() / float(self.height())))
+            self.pixel_clicked.emit(fx, fy)
+            return
         super().mousePressEvent(event)
 
     def wheelEvent(self, event: QWheelEvent):
@@ -1690,7 +1704,22 @@ class ImageViewerDialog(QDialog):
         self._spec_show_cb.toggled.connect(self._on_spec_show_toggled)
         right_lay.addWidget(self._spec_show_cb)
 
+        # Gwyddion-style "Set Z=0 here": toggle, then click on the image.
+        self._set_zero_btn = QPushButton("Set Z=0 (click on image)")
+        self._set_zero_btn.setCheckable(True)
+        self._set_zero_btn.setFont(QFont("Helvetica", 8))
+        self._set_zero_btn.setFixedHeight(24)
+        self._set_zero_btn.toggled.connect(self._zoom_lbl.set_set_zero_mode)
+        right_lay.addWidget(self._set_zero_btn)
+
+        self._set_zero_clear_btn = QPushButton("Clear Z=0 reference")
+        self._set_zero_clear_btn.setFont(QFont("Helvetica", 8))
+        self._set_zero_clear_btn.setFixedHeight(22)
+        self._set_zero_clear_btn.clicked.connect(self._on_clear_set_zero)
+        right_lay.addWidget(self._set_zero_clear_btn)
+
         self._zoom_lbl.marker_clicked.connect(self._on_marker_clicked)
+        self._zoom_lbl.pixel_clicked.connect(self._on_set_zero_pick)
 
         right_lay.addWidget(_sep())
 
@@ -1970,6 +1999,30 @@ class ImageViewerDialog(QDialog):
     def _on_marker_clicked(self, entry):
         dlg = SpecViewerDialog(entry, self._t, self)
         dlg.exec()
+
+    def _on_set_zero_pick(self, frac_x: float, frac_y: float):
+        """Handle a click on the image while Set Z=0 mode is active."""
+        if self._raw_arr is None:
+            return
+        Ny, Nx = self._raw_arr.shape
+        x_px = int(round(frac_x * (Nx - 1)))
+        y_px = int(round(frac_y * (Ny - 1)))
+        x_px = max(0, min(x_px, Nx - 1))
+        y_px = max(0, min(y_px, Ny - 1))
+        self._processing['set_zero_xy'] = (x_px, y_px)
+        self._processing['set_zero_patch'] = 1
+        # Toggle off so the next click navigates normally.
+        if self._set_zero_btn.isChecked():
+            self._set_zero_btn.setChecked(False)
+        self._status_lbl.setText(f"Z=0 set at pixel ({x_px}, {y_px})")
+        self._load_current()
+
+    def _on_clear_set_zero(self):
+        if 'set_zero_xy' in self._processing:
+            self._processing.pop('set_zero_xy', None)
+            self._processing.pop('set_zero_patch', None)
+            self._status_lbl.setText("Z=0 reference cleared")
+            self._load_current()
 
     # ── Histogram drag handlers ────────────────────────────────────────────────
     def _on_hist_press(self, event):
@@ -2321,7 +2374,14 @@ class BrowseToolPanel(QWidget):
         sec2.setAlignment(Qt.AlignCenter)
         proc_lay.addWidget(sec2)
 
-        self._bg_combo = _combo_row("Background:", ["None", "Plane", "Quadratic"])
+        self._bg_combo = _combo_row(
+            "Background:",
+            ["None", "Plane", "Quadratic", "Cubic", "Quartic"],
+        )
+
+        self._bg_step_cb = QCheckBox("Step-edge tolerant (mask high-grad)")
+        self._bg_step_cb.setFont(QFont("Helvetica", 8))
+        proc_lay.addWidget(self._bg_step_cb)
 
         self._facet_cb = QCheckBox("Facet level (flat-terrace ref)")
         self._facet_cb.setFont(QFont("Helvetica", 8))
@@ -2362,6 +2422,23 @@ class BrowseToolPanel(QWidget):
             "Cutoff:", 1, 50, 10, "{v}%")
         proc_lay.addWidget(self._fft_cutoff_widget)
         self._fft_cutoff_widget.setVisible(False)
+
+        self._fft_soft_cb = QCheckBox("Soft border (Tukey taper)")
+        self._fft_soft_cb.setFont(QFont("Helvetica", 8))
+        proc_lay.addWidget(self._fft_soft_cb)
+
+        # ── Section: Drift / linear undistort ─────────────────────────────────
+        sec_un = QLabel("— Linear undistort (drift) —")
+        sec_un.setFont(QFont("Helvetica", 7))
+        sec_un.setAlignment(Qt.AlignCenter)
+        proc_lay.addWidget(sec_un)
+
+        self._undistort_shear_w, self._undistort_shear_sl, _ = _sub_slider(
+            "Shear x:", -20, 20, 0, "{v}px")
+        proc_lay.addWidget(self._undistort_shear_w)
+        self._undistort_scale_w, self._undistort_scale_sl, _ = _sub_slider(
+            "Scale y:", 80, 120, 100, "{v}%")
+        proc_lay.addWidget(self._undistort_scale_w)
 
         # ── Section: Grain detection ───────────────────────────────────────────
         sec5 = QLabel("— Grain detection —")
@@ -2487,24 +2564,36 @@ class BrowseToolPanel(QWidget):
 
     def _on_proc_apply(self):
         align_map = {0: None, 1: 'median', 2: 'mean', 3: 'linear'}
-        bg_map    = {0: None, 1: 1, 2: 2}
+        bg_map    = {0: None, 1: 1, 2: 2, 3: 3, 4: 4}
         fft_map   = {0: None, 1: 'low_pass', 2: 'high_pass'}
         edge_map  = {0: None, 1: 'laplacian', 2: 'log', 3: 'dog'}
         smooth_i  = self._smooth_combo.currentIndex()
         edge_i    = self._edge_combo.currentIndex()
         grain_on  = self._grain_cb.isChecked()
+        fft_idx   = self._fft_combo.currentIndex()
+        soft_on   = self._fft_soft_cb.isChecked()
+        shear_x   = float(self._undistort_shear_sl.value())
+        scale_y   = self._undistort_scale_sl.value() / 100.0
         cfg = {
             'remove_bad_lines': self._rbl_cb.isChecked(),
             'align_rows':       align_map[self._align_combo.currentIndex()],
             'bg_order':         bg_map[self._bg_combo.currentIndex()],
+            'bg_step_tolerance': self._bg_step_cb.isChecked(),
             'facet_level':      self._facet_cb.isChecked(),
             'smooth_sigma':     self._smooth_sigma_sl.value() if smooth_i != 0 else None,
             'edge_method':      edge_map[edge_i],
             'edge_sigma':       self._edge_sigma_sl.value(),
             'edge_sigma2':      self._edge_sigma_sl.value() * 2,
-            'fft_mode':         fft_map[self._fft_combo.currentIndex()],
+            'fft_mode':         fft_map[fft_idx],
             'fft_cutoff':       self._fft_sl.value() / 100.0,
             'fft_window':       'hanning',
+            'fft_soft_border':  soft_on,
+            'fft_soft_mode':    fft_map.get(fft_idx) or 'low_pass',
+            'fft_soft_cutoff':  self._fft_sl.value() / 100.0,
+            'fft_soft_border_frac': 0.12,
+            'linear_undistort': (shear_x != 0.0 or scale_y != 1.0),
+            'undistort_shear_x': shear_x,
+            'undistort_scale_y': scale_y,
             'grain_threshold':  self._grain_thresh_sl.value() if grain_on else None,
             'grain_above':      self._grain_above_rb.isChecked(),
         }
@@ -3368,6 +3457,9 @@ class SpecViewerDialog(QDialog):
         self._checkboxes: dict[str, QCheckBox] = {}
         self._canvas = None
         self._fig = None
+        # Unit-override choice per base SI unit. "Auto" means use
+        # choose_display_unit; otherwise lookup_unit_scale picks a fixed scale.
+        self._unit_choice: dict[str, str] = {"m": "Auto", "A": "Auto", "V": "Auto"}
         self._build()
         self._load()
 
@@ -3394,6 +3486,46 @@ class SpecViewerDialog(QDialog):
         ch_header.setFont(QFont("Helvetica", 10, QFont.Bold))
         self._channels_lay.addWidget(ch_header)
         self._channels_lay.addStretch(1)  # placeholder; populated in _load
+
+        # Unit-override selectors for height (Z) and current channels.
+        unit_box = QGroupBox("Display units")
+        unit_box.setFont(QFont("Helvetica", 9, QFont.Bold))
+        unit_lay = QGridLayout(unit_box)
+        unit_lay.setContentsMargins(6, 4, 6, 4)
+        unit_lay.setSpacing(2)
+
+        z_lbl = QLabel("Z (m):")
+        z_lbl.setFont(QFont("Helvetica", 9))
+        self._z_unit_cb = QComboBox()
+        self._z_unit_cb.addItems(["Auto", "pm", "Å", "nm", "µm", "m"])
+        self._z_unit_cb.setFont(QFont("Helvetica", 9))
+        self._z_unit_cb.currentTextChanged.connect(
+            lambda v: self._on_unit_changed("m", v))
+
+        i_lbl = QLabel("I (A):")
+        i_lbl.setFont(QFont("Helvetica", 9))
+        self._i_unit_cb = QComboBox()
+        self._i_unit_cb.addItems(["Auto", "fA", "pA", "nA", "µA", "A"])
+        self._i_unit_cb.setFont(QFont("Helvetica", 9))
+        self._i_unit_cb.currentTextChanged.connect(
+            lambda v: self._on_unit_changed("A", v))
+
+        v_lbl = QLabel("V (V):")
+        v_lbl.setFont(QFont("Helvetica", 9))
+        self._v_unit_cb = QComboBox()
+        self._v_unit_cb.addItems(["Auto", "µV", "mV", "V"])
+        self._v_unit_cb.setFont(QFont("Helvetica", 9))
+        self._v_unit_cb.currentTextChanged.connect(
+            lambda v: self._on_unit_changed("V", v))
+
+        unit_lay.addWidget(z_lbl, 0, 0)
+        unit_lay.addWidget(self._z_unit_cb, 0, 1)
+        unit_lay.addWidget(i_lbl, 1, 0)
+        unit_lay.addWidget(self._i_unit_cb, 1, 1)
+        unit_lay.addWidget(v_lbl, 2, 0)
+        unit_lay.addWidget(self._v_unit_cb, 2, 1)
+
+        self._channels_lay.insertWidget(self._channels_lay.count() - 1, unit_box)
 
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
@@ -3476,10 +3608,14 @@ class SpecViewerDialog(QDialog):
 
     # ── Plotting ────────────────────────────────────────────────────────
 
+    def _on_unit_changed(self, base: str, label: str) -> None:
+        self._unit_choice[base] = label
+        self._redraw()
+
     def _redraw(self) -> None:
         if self._spec is None:
             return
-        from .spec_plot import choose_display_unit
+        from .spec_plot import choose_display_unit, lookup_unit_scale
 
         # Remove existing canvas if present.
         if self._canvas is not None:
@@ -3509,7 +3645,12 @@ class SpecViewerDialog(QDialog):
         for i, (ch, ax) in enumerate(zip(selected, axes)):
             y = np.asarray(spec.channels[ch], dtype=float)
             unit = spec.y_units.get(ch, "")
-            scale, disp_unit = choose_display_unit(unit, y)
+            choice = self._unit_choice.get(unit, "Auto")
+            override = lookup_unit_scale(unit, choice) if choice != "Auto" else None
+            if override is not None:
+                scale, disp_unit = override
+            else:
+                scale, disp_unit = choose_display_unit(unit, y)
             y_disp = y * scale
 
             ax.set_facecolor(self._BG)
@@ -4545,9 +4686,11 @@ class ProbeFlowWindow(QMainWindow):
             return
         plane_idx = self._features_sidebar.plane_index()
         try:
-            arr = read_sxm_plane_raw(entry.path, plane_idx)
-            hdr = parse_sxm_header(entry.path)
-            w_m, h_m = _sxm_scan_range(hdr)
+            _scan = load_scan(entry.path)
+            if plane_idx >= _scan.n_planes:
+                plane_idx = 0
+            arr = _scan.planes[plane_idx]
+            w_m, h_m = _scan.scan_range_m
         except Exception as exc:
             self._features_sidebar.set_status(f"Could not read scan: {exc}")
             return

@@ -321,6 +321,23 @@ _UNIT_PREFIX_TABLE: dict[str, list[tuple[float, str]]] = {
 }
 
 
+def lookup_unit_scale(si_unit: str, label: str) -> Optional[tuple[float, str]]:
+    """Return ``(scale, label)`` for an explicit user choice of display unit.
+
+    ``si_unit`` is the underlying SI unit (e.g. ``"m"``); ``label`` is the
+    desired display label (e.g. ``"nm"``, ``"Å"``, ``"pm"``). Returns
+    ``None`` if the label is unknown for that base unit, so callers can
+    fall back to ``choose_display_unit``.
+    """
+    table = _UNIT_PREFIX_TABLE.get(si_unit)
+    if table is None:
+        return None
+    for scale, lbl in table:
+        if lbl == label:
+            return scale, lbl
+    return None
+
+
 def choose_display_unit(si_unit: str, values: np.ndarray) -> tuple[float, str]:
     """Pick a sensible display unit and scale factor.
 
