@@ -24,9 +24,11 @@ __version__ = "beta"
 # Importing these does not pull in PySide6 / matplotlib.
 from probeflow.scan import Scan, load_scan
 from probeflow.metadata import ScanMetadata, read_scan_metadata, metadata_from_scan
+from probeflow.indexing import ProbeFlowItem, index_folder
 
 __all__ = [
     "Scan", "load_scan",
     "ScanMetadata", "read_scan_metadata", "metadata_from_scan",
+    "ProbeFlowItem", "index_folder",
     "__version__",
 ]
