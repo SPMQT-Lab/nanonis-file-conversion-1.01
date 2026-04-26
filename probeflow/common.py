@@ -61,17 +61,25 @@ def sanitize(name: str) -> str:
 def z_scale_m_per_dac(hdr: dict, vpd: float) -> float:
     """
     Return metres per DAC count for the Z channel.
-    Prefers the explicit Dacto[A]z header field (units: Å/DAC).
-    Falls back to GainZ * ZPiezoconst (Å/V) * V/DAC.
+    Prefers the explicit Createc Dacto[A]z header field.
+
+    Despite the historical ``[A]`` label, Createc's Dacto fields behave as
+    nm/DAC in the image files ProbeFlow supports. The lateral calibration gives
+    the sanity check: ``Delta X [Dac] * Dacto[A]xy`` matches ``Length x[A] /
+    Num.X`` only after converting the Dacto value as nm, not as Å. Keep this
+    comment close to the conversion so future cleanup does not reintroduce a
+    factor-of-10 Z-height error.
+
+    Falls back to GainZ * ZPiezoconst (nm/V) * V/DAC for older headers.
     """
     dz = _f(find_hdr(hdr, "Dacto[A]z", None))
     if dz is not None:
-        return dz * 1e-10  # Å/DAC → m/DAC
+        return dz * 1e-9  # Createc Dacto field: nm/DAC → m/DAC
 
     gz = _f(find_hdr(hdr, "GainZ", 10.0), 10.0)
-    zp = _f(find_hdr(hdr, "ZPiezoconst", 19.2), 19.2)  # Å/V typical
-    # V/DAC * dimensionless * Å/V = Å/DAC → × 1e-10 → m/DAC
-    return vpd * gz * zp * 1e-10
+    zp = _f(find_hdr(hdr, "ZPiezoconst", 19.2), 19.2)  # nm/V in Createc files
+    # V/DAC * dimensionless * nm/V = nm/DAC → × 1e-9 → m/DAC
+    return vpd * gz * zp * 1e-9
 
 
 def i_scale_a_per_dac(hdr: dict, vpd: float, negative: bool = True) -> float:

@@ -56,7 +56,7 @@ class TestParseSpecHeader:
         hdr = parse_spec_header(VERT_TIME_TRACE)
         assert "Dacto[A]xy" in hdr
         val = float(hdr["Dacto[A]xy"])
-        assert 0 < val < 1.0  # Å/DAC, physically reasonable
+        assert 0 < val < 1.0  # Createc Dacto field, physically reasonable
 
     def test_offset_xy_present(self):
         hdr = parse_spec_header(VERT_TIME_TRACE)
@@ -330,10 +330,11 @@ class TestSyntheticDACConversion:
     """Verify 2× DAC scale and sign convention with known raw values (#2/#22)."""
 
     def test_z_dac_to_metres(self, tmp_path):
-        # Dacto[A]z=0.00018 Å/DAC → 1.8e-14 m/DAC; z_dac=100 → z_m=1.8e-12 m
+        # Createc labels this Dacto field "[A]", but it behaves as nm/DAC.
+        # Dacto[A]z=0.00018 nm/DAC → 1.8e-13 m/DAC; z_dac=100 → 1.8e-11 m.
         f = _make_synthetic_vert(tmp_path, z_dac=100.0, i_dac=0.0)
         spec = read_spec_file(f)
-        expected_z = 100.0 * 0.00018 * 1e-10  # 1.8e-12 m
+        expected_z = 100.0 * 0.00018 * 1e-9  # 1.8e-11 m
         assert spec.channels["Z"].mean() == pytest.approx(expected_z, rel=1e-6)
 
     def test_i_dac_sign_and_scale(self, tmp_path):

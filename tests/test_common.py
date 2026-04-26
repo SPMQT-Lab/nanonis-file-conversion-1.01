@@ -142,24 +142,24 @@ class TestSanitize:
 # ─── z_scale_m_per_dac ────────────────────────────────────────────────────────
 
 class TestZScale:
-    def test_uses_dacto_A_z_when_present(self):
+    def test_uses_createc_dacto_z_as_nm_per_dac_when_present(self):
         hdr = {"Dacto[A]z": "5.0"}
         vpd = v_per_dac(20)
         zs = z_scale_m_per_dac(hdr, vpd)
-        assert zs == pytest.approx(5.0 * 1e-10)
+        assert zs == pytest.approx(5.0 * 1e-9)
 
     def test_fallback_uses_gainz_zpiezoconst(self):
         hdr = {"GainZ": "10.0", "ZPiezoconst": "19.2"}
         vpd = v_per_dac(20)
         zs = z_scale_m_per_dac(hdr, vpd)
-        expected = vpd * 10.0 * 19.2 * 1e-10
+        expected = vpd * 10.0 * 19.2 * 1e-9
         assert zs == pytest.approx(expected, rel=1e-6)
 
     def test_returns_metres(self):
         hdr = {"Dacto[A]z": "1.0"}
         vpd = v_per_dac(20)
         zs = z_scale_m_per_dac(hdr, vpd)
-        assert zs == pytest.approx(1e-10)
+        assert zs == pytest.approx(1e-9)
 
 
 # ─── i_scale_a_per_dac ────────────────────────────────────────────────────────

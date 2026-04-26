@@ -184,9 +184,13 @@ def construct_hdr(
 
     ox_dac = _f(dat_hdr.get("OffsetX", "0"), 0.0)
     oy_dac = _f(dat_hdr.get("OffsetY", "0"), 0.0)
-    dac_to_a = _f(dat_hdr.get("Dacto[A]xy", "1"), 1.0)
-    ox_m = sci(ox_dac * dac_to_a * 1e-10, 6)
-    oy_m = sci(oy_dac * dac_to_a * 1e-10, 6)
+    dac_to_nm = _f(dat_hdr.get("Dacto[A]xy", "1"), 1.0)
+    # Createc labels this Dacto field with "[A]", but lateral self-consistency
+    # against Length x[A] and Delta X [Dac] shows the value is nm/DAC. Use the
+    # same convention as z_scale_m_per_dac so spec-marker offsets do not inherit
+    # the historical factor-of-10 ambiguity.
+    ox_m = sci(ox_dac * dac_to_nm * 1e-9, 6)
+    oy_m = sci(oy_dac * dac_to_nm * 1e-9, 6)
 
     bias_mv = _f(dat_hdr.get("Biasvolt[mV]", "0"), 0.0)
     bias_str = sci(bias_mv * 1e-3, 3)
