@@ -28,6 +28,7 @@ _SUPPORTED_OPS: frozenset[str] = frozenset({
     "remove_bad_lines",
     "align_rows",
     "plane_bg",
+    "stm_line_bg",
     "facet_level",
     "smooth",
     "edge_detect",
@@ -132,6 +133,11 @@ def apply_processing_state(arr: np.ndarray, state: ProcessingState) -> np.ndarra
                 a,
                 order=int(p.get("order", 1)),
                 step_tolerance=bool(p.get("step_tolerance", False)),
+            )
+        elif step.op == "stm_line_bg":
+            a = _proc.stm_line_background(
+                a,
+                mode=str(p.get("mode", "step_tolerant")),
             )
         elif step.op == "facet_level":
             a = _proc.facet_level(a)

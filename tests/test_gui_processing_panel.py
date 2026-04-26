@@ -34,6 +34,7 @@ def test_browse_quick_panel_emits_only_thumbnail_corrections(qapp):
     panel.set_state({
         "align_rows": "median",
         "bg_order": 4,
+        "stm_line_bg": "step_tolerant",
         "facet_level": True,
         "smooth_sigma": 3,
         "fft_mode": "high_pass",
@@ -50,6 +51,7 @@ def test_viewer_full_panel_round_trips_advanced_processing_state(qapp):
         "align_rows": "mean",
         "bg_order": 4,
         "bg_step_tolerance": True,
+        "stm_line_bg": "step_tolerant",
         "facet_level": True,
         "smooth_sigma": 3,
         "edge_method": "dog",
@@ -67,6 +69,7 @@ def test_viewer_full_panel_round_trips_advanced_processing_state(qapp):
     assert state["align_rows"] == "mean"
     assert state["bg_order"] == 4
     assert state["bg_step_tolerance"] is True
+    assert state["stm_line_bg"] == "step_tolerant"
     assert state["facet_level"] is True
     assert state["smooth_sigma"] == 3
     assert state["edge_method"] == "dog"

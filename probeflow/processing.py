@@ -117,10 +117,10 @@ def subtract_background(
     order:
         Total polynomial order. Supported values are 1, 2, 3, 4.
     step_tolerance:
-        When True, ImageJ-style step-edge masking — pixels whose finite-
+        When True, use a step-tolerant surface mask: pixels whose finite-
         difference gradient exceeds ``tan(step_threshold_deg)`` are excluded
-        from the fit so terraces dominate. Falls back to a full-pixel fit
-        when fewer than ``n_terms`` pixels remain after masking.
+        from this polynomial surface fit. Falls back to a full-pixel fit when
+        fewer than ``n_terms`` pixels remain after masking.
     step_threshold_deg:
         Slope angle (degrees) above which a pixel is treated as a step edge.
 
@@ -165,7 +165,83 @@ def subtract_background(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 3.  align_rows  (Gwyddion: "Align Rows")
+# 3.  stm_line_background
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _modal_shift(values: np.ndarray, *, bins: int = 128) -> Optional[float]:
+    """Estimate the dominant value from the peak of a 1-D histogram."""
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return None
+    if values.size == 1:
+        return float(values[0])
+    vmin = float(np.min(values))
+    vmax = float(np.max(values))
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        return None
+    if vmin == vmax:
+        return vmin
+    hist, edges = np.histogram(values, bins=min(bins, max(8, values.size)))
+    if hist.size == 0 or int(hist.max()) == 0:
+        return float(np.nanmedian(values))
+    peak = int(np.argmax(hist))
+    in_peak = (values >= edges[peak]) & (values <= edges[peak + 1])
+    if np.any(in_peak):
+        return float(np.nanmedian(values[in_peak]))
+    return float(0.5 * (edges[peak] + edges[peak + 1]))
+
+
+def stm_line_background(arr: np.ndarray, mode: str = "step_tolerant") -> np.ndarray:
+    """Subtract an STM-style step-tolerant line background.
+
+    The step-tolerant mode estimates each adjacent scan-line offset from the
+    modal peak of a histogram of pixelwise row differences.  This follows the
+    dominant terrace-to-terrace shift rather than the mean height, so partial
+    step edges do not dominate the correction.
+    """
+    if mode != "step_tolerant":
+        raise ValueError(f"mode must be 'step_tolerant', got {mode!r}")
+
+    arr = arr.astype(np.float64, copy=True)
+    Ny, Nx = arr.shape
+    if Ny < 2 or Nx < 1:
+        return arr
+
+    shifts = np.zeros(Ny, dtype=np.float64)
+    prev_shift = 0.0
+    have_shift = False
+
+    for r in range(1, Ny):
+        diff = arr[r] - arr[r - 1]
+        diff = diff[np.isfinite(diff)]
+        if diff.size == 0:
+            shifts[r] = shifts[r - 1]
+            continue
+
+        if have_shift:
+            residual = diff - prev_shift
+            delta = _modal_shift(residual)
+            shift = prev_shift if delta is None else prev_shift + delta
+        else:
+            modal = _modal_shift(diff)
+            if modal is None:
+                shifts[r] = shifts[r - 1]
+                continue
+            shift = modal
+            have_shift = True
+
+        prev_shift = shift
+        shifts[r] = shifts[r - 1] + shift
+
+    if not have_shift:
+        return arr
+
+    profile = shifts - float(np.nanmedian(shifts))
+    return arr - profile[:, None]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 4.  align_rows  (Gwyddion: "Align Rows")
 # ═════════════════════════════════════════════════════════════════════════════
 
 def align_rows(arr: np.ndarray, method: str = 'median') -> np.ndarray:

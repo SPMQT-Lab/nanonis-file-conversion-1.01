@@ -16,6 +16,7 @@ from probeflow.processing import (
     gmm_autoclip,
     measure_periodicity,
     remove_bad_lines,
+    stm_line_background,
     subtract_background,
 )
 from probeflow.cli import main as cli_main
@@ -169,6 +170,51 @@ class TestSubtractBackground:
 
     def test_preserves_shape(self, tilted_image):
         assert subtract_background(tilted_image).shape == tilted_image.shape
+
+
+# ─── stm_line_background ─────────────────────────────────────────────────────
+
+class TestStmLineBackground:
+    @staticmethod
+    def _stepped_drift_image():
+        Ny, Nx = 48, 80
+        row_steps = np.where(np.arange(Ny) % 2 == 0, 0.03, 0.01)
+        row_drift = np.cumsum(row_steps)
+        arr = row_drift[:, None] + np.zeros((Ny, Nx), dtype=np.float64)
+        arr[:, :30] += 2.5
+        return arr
+
+    def test_step_tolerant_mode_reduces_row_drift(self):
+        arr = self._stepped_drift_image()
+        out = stm_line_background(arr)
+        before = float(np.std(np.nanmedian(arr, axis=1)))
+        after = float(np.std(np.nanmedian(out, axis=1)))
+        assert after < before * 0.05
+
+    def test_step_contrast_is_preserved(self):
+        arr = self._stepped_drift_image()
+        out = stm_line_background(arr)
+        before = float(np.nanmedian(arr[:, :30]) - np.nanmedian(arr[:, 30:]))
+        after = float(np.nanmedian(out[:, :30]) - np.nanmedian(out[:, 30:]))
+        assert abs(after - before) < 1e-9
+
+    def test_shape_dtype_and_nans_stable(self):
+        arr = self._stepped_drift_image().astype(np.float32)
+        arr[5, 10:20] = np.nan
+        out = stm_line_background(arr)
+        assert out.shape == arr.shape
+        assert out.dtype == np.float64
+        assert np.all(np.isnan(out[5, 10:20]))
+
+    def test_no_usable_adjacent_differences_returns_copy(self):
+        arr = np.array([[1.0, np.nan], [np.nan, 2.0]])
+        out = stm_line_background(arr)
+        np.testing.assert_array_equal(out, arr)
+        assert out is not arr
+
+    def test_invalid_mode_raises(self):
+        with pytest.raises(ValueError, match="step_tolerant"):
+            stm_line_background(np.ones((4, 4)), mode="other")
 
 
 # ─── align_rows ──────────────────────────────────────────────────────────────

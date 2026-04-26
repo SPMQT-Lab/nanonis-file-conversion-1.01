@@ -19,6 +19,7 @@ NUMERIC_PROC_KEYS: tuple[str, ...] = (
     "align_rows",
     "bg_order",
     "bg_step_tolerance",
+    "stm_line_bg",
     "facet_level",
     "smooth_sigma",
     "edge_method",
@@ -55,6 +56,9 @@ def processing_state_from_gui(gui_state: dict) -> "ProcessingState":
             "order": int(bg_order),
             "step_tolerance": bool(gui_state.get("bg_step_tolerance", False)),
         }))
+
+    if gui_state.get("stm_line_bg") == "step_tolerant":
+        steps.append(ProcessingStep("stm_line_bg", {"mode": "step_tolerant"}))
 
     if gui_state.get("facet_level"):
         steps.append(ProcessingStep("facet_level", {"threshold_deg": 3.0}))

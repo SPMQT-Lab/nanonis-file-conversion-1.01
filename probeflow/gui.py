@@ -1534,9 +1534,18 @@ class ProcessingControlPanel(QWidget):
             "Background:",
             ["None", "Plane", "Quadratic", "Cubic", "Quartic"],
         )
-        self._bg_step_cb = QCheckBox("Step-edge tolerant (mask high-grad)")
+        self._bg_step_cb = QCheckBox("Step-tolerant surface mask")
         self._bg_step_cb.setFont(QFont("Helvetica", 8))
+        self._bg_step_cb.setToolTip(
+            "Ignores steep pixels during polynomial surface fitting. "
+            "This is not the STM line-background algorithm."
+        )
         lay.addWidget(self._bg_step_cb)
+
+        self._stm_line_bg_combo = _combo_row(
+            "STM line background:",
+            ["None", "Step tolerant"],
+        )
 
         self._facet_cb = QCheckBox("Facet level (flat-terrace ref)")
         self._facet_cb.setFont(QFont("Helvetica", 8))
@@ -1611,6 +1620,11 @@ class ProcessingControlPanel(QWidget):
         cfg.update({
             "bg_order": bg_map[self._bg_combo.currentIndex()],
             "bg_step_tolerance": self._bg_step_cb.isChecked(),
+            "stm_line_bg": (
+                "step_tolerant"
+                if self._stm_line_bg_combo.currentIndex() == 1
+                else None
+            ),
             "facet_level": self._facet_cb.isChecked(),
             "smooth_sigma": self._smooth_sigma_sl.value() if smooth_i != 0 else None,
             "edge_method": edge_map[edge_i],
@@ -1639,6 +1653,8 @@ class ProcessingControlPanel(QWidget):
         self._bg_combo.setCurrentIndex(
             {None: 0, 1: 1, 2: 2, 3: 3, 4: 4}.get(state.get("bg_order"), 0))
         self._bg_step_cb.setChecked(bool(state.get("bg_step_tolerance", False)))
+        self._stm_line_bg_combo.setCurrentIndex(
+            {"step_tolerant": 1}.get(state.get("stm_line_bg"), 0))
         self._facet_cb.setChecked(bool(state.get("facet_level", False)))
 
         sigma = state.get("smooth_sigma")

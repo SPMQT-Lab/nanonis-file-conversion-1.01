@@ -202,6 +202,12 @@ class TestGuiConversion:
         state = processing_state_from_gui({"bg_order": 1})
         assert state.steps[0].params["step_tolerance"] is False
 
+    def test_stm_line_background_step_tolerant_captured(self):
+        state = processing_state_from_gui({"stm_line_bg": "step_tolerant"})
+        assert len(state.steps) == 1
+        assert state.steps[0].op == "stm_line_bg"
+        assert state.steps[0].params == {"mode": "step_tolerant"}
+
     def test_fft_soft_border_params_captured(self):
         gui = {
             "fft_soft_border":      True,
@@ -360,6 +366,16 @@ class TestApplyKnownSteps:
         result = apply_processing_state(arr, state)
         assert result.shape == arr.shape
         assert result.dtype == np.float64
+
+    def test_stm_line_bg_runs(self):
+        arr = np.ones((20, 20), dtype=float)
+        arr += np.linspace(0.0, 1.0, 20)[:, None]
+        state = ProcessingState(steps=[
+            ProcessingStep("stm_line_bg", {"mode": "step_tolerant"}),
+        ])
+        result = apply_processing_state(arr, state)
+        assert result.shape == arr.shape
+        assert float(np.std(np.nanmedian(result, axis=1))) < 1e-10
 
     def test_fft_soft_border_runs_and_preserves_shape(self):
         rng = np.random.default_rng(2)
