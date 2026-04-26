@@ -202,11 +202,91 @@ class TestGuiConversion:
         state = processing_state_from_gui({"bg_order": 1})
         assert state.steps[0].params["step_tolerance"] is False
 
+    def test_background_fit_rect_captured_for_polynomial_fit(self):
+        state = processing_state_from_gui({
+            "bg_order": 1,
+            "background_fit_rect": (0, 1, 8, 9),
+        })
+        assert len(state.steps) == 1
+        assert state.steps[0].op == "plane_bg"
+        assert state.steps[0].params == {
+            "order": 1,
+            "step_tolerance": False,
+            "fit_rect": (0, 1, 8, 9),
+        }
+
+    def test_bad_background_fit_rect_is_ignored(self):
+        state = processing_state_from_gui({
+            "bg_order": 1,
+            "background_fit_rect": "bad",
+        })
+        assert len(state.steps) == 1
+        assert "fit_rect" not in state.steps[0].params
+
     def test_stm_line_background_step_tolerant_captured(self):
         state = processing_state_from_gui({"stm_line_bg": "step_tolerant"})
         assert len(state.steps) == 1
         assert state.steps[0].op == "stm_line_bg"
         assert state.steps[0].params == {"mode": "step_tolerant"}
+
+    def test_roi_scope_wraps_local_filter_step(self):
+        gui = {
+            "processing_scope": "roi",
+            "roi_rect": (2, 3, 8, 9),
+            "smooth_sigma": 1.5,
+        }
+        state = processing_state_from_gui(gui)
+        assert len(state.steps) == 1
+        step = state.steps[0]
+        assert step.op == "roi"
+        assert step.params["rect"] == (2, 3, 8, 9)
+        assert step.params["step"] == {
+            "op": "smooth",
+            "params": {"sigma_px": 1.5},
+        }
+
+    def test_roi_scope_keeps_global_background_steps_global(self):
+        gui = {
+            "processing_scope": "roi",
+            "roi_rect": (2, 3, 8, 9),
+            "align_rows": "median",
+            "bg_order": 1,
+            "stm_line_bg": "step_tolerant",
+            "smooth_sigma": 1.0,
+        }
+        state = processing_state_from_gui(gui)
+        assert [s.op for s in state.steps] == [
+            "align_rows",
+            "plane_bg",
+            "stm_line_bg",
+            "roi",
+        ]
+        assert state.steps[-1].params["step"]["op"] == "smooth"
+
+    def test_bad_roi_rect_falls_back_to_global_local_filter(self):
+        gui = {
+            "processing_scope": "roi",
+            "roi_rect": "not-a-rect",
+            "smooth_sigma": 1.0,
+        }
+        state = processing_state_from_gui(gui)
+        assert len(state.steps) == 1
+        assert state.steps[0].op == "smooth"
+
+    def test_roi_scope_wraps_soft_border_fft(self):
+        gui = {
+            "processing_scope": "roi",
+            "roi_rect": (1, 2, 12, 14),
+            "fft_soft_border": True,
+            "fft_soft_mode": "high_pass",
+            "fft_soft_cutoff": 0.25,
+        }
+        state = processing_state_from_gui(gui)
+        assert len(state.steps) == 1
+        step = state.steps[0]
+        assert step.op == "roi"
+        assert step.params["step"]["op"] == "fft_soft_border"
+        assert step.params["step"]["params"]["mode"] == "high_pass"
 
     def test_fft_soft_border_params_captured(self):
         gui = {
@@ -367,6 +447,19 @@ class TestApplyKnownSteps:
         assert result.shape == arr.shape
         assert result.dtype == np.float64
 
+    def test_plane_bg_fit_rect_runs(self):
+        y = np.linspace(-1.0, 1.0, 20)
+        x = np.linspace(-1.0, 1.0, 20)
+        X, Y = np.meshgrid(x, y)
+        arr = 2.0 * X - 0.5 * Y + 7.0
+        arr[:, 12:] += 25.0
+        state = ProcessingState(steps=[
+            ProcessingStep("plane_bg", {"order": 1, "fit_rect": (0, 0, 8, 19)}),
+        ])
+        result = apply_processing_state(arr, state)
+        assert float(np.nanstd(result[:, :9])) < 1e-10
+        assert abs(float(np.nanmedian(result[:, 12:])) - 25.0) < 1e-10
+
     def test_stm_line_bg_runs(self):
         arr = np.ones((20, 20), dtype=float)
         arr += np.linspace(0.0, 1.0, 20)[:, None]
@@ -376,6 +469,35 @@ class TestApplyKnownSteps:
         result = apply_processing_state(arr, state)
         assert result.shape == arr.shape
         assert float(np.std(np.nanmedian(result, axis=1))) < 1e-10
+
+    def test_roi_smooth_changes_only_selected_rectangle(self):
+        rng = np.random.default_rng(3)
+        arr = np.zeros((16, 16), dtype=float)
+        arr[5:11, 5:11] = rng.normal(size=(6, 6))
+        state = ProcessingState(steps=[
+            ProcessingStep("roi", {
+                "rect": (5, 5, 10, 10),
+                "step": {"op": "smooth", "params": {"sigma_px": 1.0}},
+            }),
+        ])
+        result = apply_processing_state(arr, state)
+
+        outside = np.ones(arr.shape, dtype=bool)
+        outside[5:11, 5:11] = False
+        np.testing.assert_array_equal(result[outside], arr[outside])
+        assert not np.allclose(result[5:11, 5:11], arr[5:11, 5:11])
+
+    def test_roi_wrapper_ignores_nonlocal_nested_operation(self):
+        x = np.linspace(0, 1, 12)
+        arr = np.outer(np.ones(12), x)
+        state = ProcessingState(steps=[
+            ProcessingStep("roi", {
+                "rect": (2, 2, 8, 8),
+                "step": {"op": "plane_bg", "params": {"order": 1}},
+            }),
+        ])
+        result = apply_processing_state(arr, state)
+        np.testing.assert_array_equal(result, arr)
 
     def test_fft_soft_border_runs_and_preserves_shape(self):
         rng = np.random.default_rng(2)

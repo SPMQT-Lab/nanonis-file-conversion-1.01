@@ -98,6 +98,18 @@ class TestSubtractBackground:
         out = subtract_background(bg + signal, order=1)
         assert float(np.ptp(out)) < 1e-8
 
+    def test_fit_rect_uses_selection_but_subtracts_whole_image(self):
+        y = np.linspace(-1.0, 1.0, 20)
+        x = np.linspace(-1.0, 1.0, 20)
+        X, Y = np.meshgrid(x, y)
+        arr = 2.0 * X - 0.5 * Y + 7.0
+        arr[:, 12:] += 25.0
+
+        out = subtract_background(arr, order=1, fit_rect=(0, 0, 8, 19))
+
+        assert float(np.nanstd(out[:, :9])) < 1e-10
+        assert abs(float(np.nanmedian(out[:, 12:])) - 25.0) < 1e-10
+
     def test_order2_removes_quadratic(self):
         Y, X = np.mgrid[:20, :20]
         quad = (0.01 * X**2 + 0.02 * Y**2 + 0.1 * X + 3.0).astype(np.float64)

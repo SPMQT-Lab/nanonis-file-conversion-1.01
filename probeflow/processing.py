@@ -107,6 +107,7 @@ def subtract_background(
     *,
     step_tolerance: bool = False,
     step_threshold_deg: float = 3.0,
+    fit_rect: Optional[tuple[int, int, int, int]] = None,
 ) -> np.ndarray:
     """Fit and subtract a 2D polynomial background from an image.
 
@@ -123,6 +124,10 @@ def subtract_background(
         fewer than ``n_terms`` pixels remain after masking.
     step_threshold_deg:
         Slope angle (degrees) above which a pixel is treated as a step edge.
+    fit_rect:
+        Optional inclusive pixel rectangle ``(x0, y0, x1, y1)`` limiting which
+        pixels contribute to the polynomial fit. The fitted background is still
+        reconstructed and subtracted over the whole image.
 
     Coordinates are normalised to [-1, 1] for numerical stability. Only
     finite pixels participate in the least-squares fit. NaNs in the input
@@ -148,11 +153,30 @@ def subtract_background(
         return arr
 
     fit_mask = finite
+    if fit_rect is not None:
+        try:
+            x0, y0, x1, y1 = [int(v) for v in fit_rect]
+        except (TypeError, ValueError):
+            return arr
+        x0 = max(0, min(Nx - 1, x0))
+        x1 = max(0, min(Nx - 1, x1))
+        y0 = max(0, min(Ny - 1, y0))
+        y1 = max(0, min(Ny - 1, y1))
+        if x1 <= x0 or y1 <= y0:
+            return arr
+        rect_mask = np.zeros(arr.shape, dtype=bool)
+        rect_mask[y0:y1 + 1, x0:x1 + 1] = True
+        fit_mask = fit_mask & rect_mask.ravel()
+        if fit_mask.sum() < n_terms:
+            return arr
+
     if step_tolerance and Ny >= 3 and Nx >= 3:
         gy, gx = np.gradient(np.where(np.isfinite(arr), arr, 0.0))
         slope_mag = np.sqrt(gx ** 2 + gy ** 2).ravel()
         tan_thresh = math.tan(math.radians(step_threshold_deg))
         candidate = finite & (slope_mag < tan_thresh)
+        if fit_rect is not None:
+            candidate = candidate & fit_mask
         if candidate.sum() >= n_terms:
             fit_mask = candidate
 

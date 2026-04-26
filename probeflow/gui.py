@@ -1349,6 +1349,7 @@ class _ZoomLabel(QLabel):
 
     marker_clicked = Signal(object)  # emits VertFile when user clicks a marker
     pixel_clicked  = Signal(float, float)  # (frac_x, frac_y) — only when set_zero_mode is on
+    roi_selected   = Signal(float, float, float, float)  # fractional x0, y0, x1, y1
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1358,11 +1359,33 @@ class _ZoomLabel(QLabel):
         self._markers: list[dict] = []   # each: {frac_x, frac_y, entry}
         self._show_markers: bool = True
         self._set_zero_mode: bool = False
+        self._roi_mode: bool = False
+        self._roi_start = None
+        self._roi_rect = None
         self.setMouseTracking(True)
 
     def set_set_zero_mode(self, enabled: bool):
         self._set_zero_mode = bool(enabled)
-        self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
+        self._update_cursor()
+
+    def set_roi_mode(self, enabled: bool):
+        self._roi_mode = bool(enabled)
+        if not enabled:
+            self._roi_start = None
+            self._roi_rect = None
+            self.update()
+        self._update_cursor()
+
+    def clear_roi(self):
+        self._roi_start = None
+        self._roi_rect = None
+        self.update()
+
+    def _update_cursor(self):
+        self.setCursor(
+            Qt.CrossCursor if (self._set_zero_mode or self._roi_mode)
+            else Qt.ArrowCursor
+        )
 
     def set_source(self, pixmap: QPixmap):
         self._pixmap_orig = pixmap
@@ -1401,23 +1424,32 @@ class _ZoomLabel(QLabel):
 
     def paintEvent(self, event):
         super().paintEvent(event)
-        if not self._show_markers or not self._markers or self._pixmap_orig is None:
+        if self._pixmap_orig is None:
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        r = 7
-        for i, m in enumerate(self._markers):
-            sx, sy = self._marker_px(m["frac_x"], m["frac_y"])
-            painter.setBrush(QBrush(QColor("#FFD700")))
-            painter.setPen(QPen(QColor("black"), 1.5))
-            painter.drawEllipse(sx - r, sy - r, 2 * r, 2 * r)
-            painter.setFont(QFont("Helvetica", 6, QFont.Bold))
-            painter.setPen(QPen(QColor("black")))
-            painter.drawText(QRect(sx - r, sy - r, 2 * r, 2 * r),
-                             Qt.AlignCenter, str(i + 1))
+        if self._show_markers and self._markers:
+            r = 7
+            for i, m in enumerate(self._markers):
+                sx, sy = self._marker_px(m["frac_x"], m["frac_y"])
+                painter.setBrush(QBrush(QColor("#FFD700")))
+                painter.setPen(QPen(QColor("black"), 1.5))
+                painter.drawEllipse(sx - r, sy - r, 2 * r, 2 * r)
+                painter.setFont(QFont("Helvetica", 6, QFont.Bold))
+                painter.setPen(QPen(QColor("black")))
+                painter.drawText(QRect(sx - r, sy - r, 2 * r, 2 * r),
+                                 Qt.AlignCenter, str(i + 1))
+        if self._roi_rect is not None:
+            painter.setBrush(QBrush(QColor(137, 180, 250, 45)))
+            painter.setPen(QPen(QColor("#89b4fa"), 2))
+            painter.drawRect(self._roi_rect)
         painter.end()
 
     def mouseMoveEvent(self, event):
+        if self._roi_mode and self._roi_start is not None:
+            self._roi_rect = QRect(self._roi_start, event.pos()).normalized()
+            self.update()
+            return
         if self._show_markers and self._markers and self._pixmap_orig is not None:
             pos = event.pos()
             for m in self._markers:
@@ -1436,6 +1468,12 @@ class _ZoomLabel(QLabel):
         super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event):
+        if (event.button() == Qt.LeftButton and self._roi_mode
+                and self._pixmap_orig is not None):
+            self._roi_start = event.pos()
+            self._roi_rect = QRect(self._roi_start, self._roi_start)
+            self.update()
+            return
         if (event.button() == Qt.LeftButton and self._show_markers
                 and self._markers and self._pixmap_orig is not None):
             pos = event.pos()
@@ -1453,6 +1491,24 @@ class _ZoomLabel(QLabel):
             self.pixel_clicked.emit(fx, fy)
             return
         super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if (event.button() == Qt.LeftButton and self._roi_mode
+                and self._roi_start is not None and self._pixmap_orig is not None):
+            rect = QRect(self._roi_start, event.pos()).normalized()
+            self._roi_start = None
+            if rect.width() >= 3 and rect.height() >= 3 and self.width() > 0 and self.height() > 0:
+                x0 = max(0.0, min(1.0, rect.left() / float(self.width())))
+                y0 = max(0.0, min(1.0, rect.top() / float(self.height())))
+                x1 = max(0.0, min(1.0, rect.right() / float(self.width())))
+                y1 = max(0.0, min(1.0, rect.bottom() / float(self.height())))
+                self._roi_rect = rect
+                self.roi_selected.emit(x0, y0, x1, y1)
+            else:
+                self._roi_rect = None
+            self.update()
+            return
+        super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event: QWheelEvent):
         if event.modifiers() & Qt.ControlModifier:
@@ -1717,6 +1773,7 @@ class ImageViewerDialog(QDialog):
         self._scan_range_m: Optional[tuple] = None
         self._scan_shape: Optional[tuple] = None
         self._scan_format: str = ""
+        self._roi_rect_px: Optional[tuple[int, int, int, int]] = None
 
         self._build()
         self._processing_panel.set_state(self._processing)
@@ -1872,6 +1929,50 @@ class ImageViewerDialog(QDialog):
 
         right_lay.addWidget(_sep())
 
+        # ROI selection plumbing for local image filters; global/background
+        # corrections still run against the whole image.
+        roi_lbl = QLabel("Selection")
+        roi_lbl.setFont(QFont("Helvetica", 9, QFont.Bold))
+        right_lay.addWidget(roi_lbl)
+
+        roi_row = QHBoxLayout()
+        self._roi_btn = QPushButton("Select region")
+        self._roi_btn.setCheckable(True)
+        self._roi_btn.setFont(QFont("Helvetica", 8))
+        self._roi_btn.setFixedHeight(24)
+        self._roi_btn.toggled.connect(self._on_roi_mode_toggled)
+        roi_row.addWidget(self._roi_btn, 1)
+
+        self._roi_clear_btn = QPushButton("Clear")
+        self._roi_clear_btn.setFont(QFont("Helvetica", 8))
+        self._roi_clear_btn.setFixedHeight(24)
+        self._roi_clear_btn.clicked.connect(self._on_clear_roi)
+        roi_row.addWidget(self._roi_clear_btn)
+        right_lay.addLayout(roi_row)
+
+        self._scope_cb = QComboBox()
+        self._scope_cb.addItems(["Whole image", "Selected region only"])
+        self._scope_cb.setFont(QFont("Helvetica", 8))
+        self._scope_cb.setToolTip(
+            "Selected-region processing applies local filters only; backgrounds and scan-line tools remain whole-image operations."
+        )
+        right_lay.addWidget(self._scope_cb)
+
+        self._bg_fit_roi_cb = QCheckBox("Fit surface background from selection")
+        self._bg_fit_roi_cb.setFont(QFont("Helvetica", 8))
+        self._bg_fit_roi_cb.setToolTip(
+            "Fits Plane/Quadratic/Cubic/Quartic background using the selected pixels, "
+            "then subtracts that fitted surface from the whole image."
+        )
+        right_lay.addWidget(self._bg_fit_roi_cb)
+
+        self._roi_status_lbl = QLabel("Selection: none")
+        self._roi_status_lbl.setFont(QFont("Helvetica", 8))
+        self._roi_status_lbl.setWordWrap(True)
+        right_lay.addWidget(self._roi_status_lbl)
+
+        right_lay.addWidget(_sep())
+
         # processing
         proc_toggle = QPushButton("[+] Processing")
         proc_toggle.setFlat(True)
@@ -1918,7 +2019,7 @@ class ImageViewerDialog(QDialog):
         self._set_zero_btn.setCheckable(True)
         self._set_zero_btn.setFont(QFont("Helvetica", 8))
         self._set_zero_btn.setFixedHeight(24)
-        self._set_zero_btn.toggled.connect(self._zoom_lbl.set_set_zero_mode)
+        self._set_zero_btn.toggled.connect(self._on_set_zero_mode_toggled)
         right_lay.addWidget(self._set_zero_btn)
 
         self._set_zero_clear_btn = QPushButton("Clear Z=0 reference")
@@ -1929,6 +2030,7 @@ class ImageViewerDialog(QDialog):
 
         self._zoom_lbl.marker_clicked.connect(self._on_marker_clicked)
         self._zoom_lbl.pixel_clicked.connect(self._on_set_zero_pick)
+        self._zoom_lbl.roi_selected.connect(self._on_roi_selected)
 
         right_lay.addWidget(_sep())
 
@@ -2209,6 +2311,51 @@ class ImageViewerDialog(QDialog):
         dlg = SpecViewerDialog(entry, self._t, self)
         dlg.exec()
 
+    def _on_roi_mode_toggled(self, checked: bool):
+        if checked and self._set_zero_btn.isChecked():
+            self._set_zero_btn.setChecked(False)
+        self._zoom_lbl.set_roi_mode(checked)
+        self._roi_btn.setText("Selecting..." if checked else "Select region")
+
+    def _on_set_zero_mode_toggled(self, checked: bool):
+        if checked and self._roi_btn.isChecked():
+            self._roi_btn.setChecked(False)
+        self._zoom_lbl.set_set_zero_mode(checked)
+
+    def _on_roi_selected(self, x0f: float, y0f: float, x1f: float, y1f: float):
+        arr = self._raw_arr if self._raw_arr is not None else self._display_arr
+        if arr is None:
+            self._roi_rect_px = None
+            self._roi_status_lbl.setText("Selection: none")
+            return
+        Ny, Nx = arr.shape
+        x0 = max(0, min(Nx - 1, int(round(min(x0f, x1f) * (Nx - 1)))))
+        x1 = max(0, min(Nx - 1, int(round(max(x0f, x1f) * (Nx - 1)))))
+        y0 = max(0, min(Ny - 1, int(round(min(y0f, y1f) * (Ny - 1)))))
+        y1 = max(0, min(Ny - 1, int(round(max(y0f, y1f) * (Ny - 1)))))
+        if x1 <= x0 or y1 <= y0:
+            self._on_clear_roi()
+            return
+        self._roi_rect_px = (x0, y0, x1, y1)
+        self._roi_status_lbl.setText(
+            f"Selection: x {x0}-{x1}, y {y0}-{y1} "
+            f"({x1 - x0 + 1} x {y1 - y0 + 1} px)"
+        )
+        if self._roi_btn.isChecked():
+            self._roi_btn.setChecked(False)
+
+    def _on_clear_roi(self):
+        self._roi_rect_px = None
+        self._processing.pop("processing_scope", None)
+        self._processing.pop("roi_rect", None)
+        self._processing.pop("background_fit_rect", None)
+        self._zoom_lbl.clear_roi()
+        if self._roi_btn.isChecked():
+            self._roi_btn.setChecked(False)
+        self._scope_cb.setCurrentIndex(0)
+        self._bg_fit_roi_cb.setChecked(False)
+        self._roi_status_lbl.setText("Selection: none")
+
     def _on_set_zero_pick(self, frac_x: float, frac_y: float):
         """Handle a click on the image while Set Z=0 mode is active."""
         if self._raw_arr is None:
@@ -2322,6 +2469,11 @@ class ImageViewerDialog(QDialog):
 
     # ── Controls ───────────────────────────────────────────────────────────────
     def _on_apply_processing(self):
+        wants_filter_roi = self._scope_cb.currentIndex() == 1
+        wants_bg_fit_roi = self._bg_fit_roi_cb.isChecked()
+        if (wants_filter_roi or wants_bg_fit_roi) and self._roi_rect_px is None:
+            self._status_lbl.setText("Select a region before using selection-based processing.")
+            return
         set_zero = {
             key: self._processing[key]
             for key in ("set_zero_xy", "set_zero_patch")
@@ -2329,6 +2481,16 @@ class ImageViewerDialog(QDialog):
         }
         self._processing = self._processing_panel.state()
         self._processing.update(set_zero)
+        if wants_filter_roi:
+            self._processing["processing_scope"] = "roi"
+            self._processing["roi_rect"] = self._roi_rect_px
+        else:
+            self._processing.pop("processing_scope", None)
+            self._processing.pop("roi_rect", None)
+        if wants_bg_fit_roi and self._processing.get("bg_order") is not None:
+            self._processing["background_fit_rect"] = self._roi_rect_px
+        else:
+            self._processing.pop("background_fit_rect", None)
         self._load_current()
 
     def _on_save_png(self):

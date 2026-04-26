@@ -36,6 +36,14 @@ _SUPPORTED_OPS: frozenset[str] = frozenset({
     "fft_soft_border",
     "linear_undistort",
     "set_zero_point",
+    "roi",
+})
+
+_ROI_ELIGIBLE_OPS: frozenset[str] = frozenset({
+    "smooth",
+    "edge_detect",
+    "fourier_filter",
+    "fft_soft_border",
 })
 
 
@@ -47,6 +55,10 @@ class ProcessingStep:
 
     op: str
     params: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ProcessingStep":
+        return cls(op=str(data["op"]), params=dict(data.get("params", {})))
 
 
 @dataclass
@@ -133,6 +145,7 @@ def apply_processing_state(arr: np.ndarray, state: ProcessingState) -> np.ndarra
                 a,
                 order=int(p.get("order", 1)),
                 step_tolerance=bool(p.get("step_tolerance", False)),
+                fit_rect=p.get("fit_rect"),
             )
         elif step.op == "stm_line_bg":
             a = _proc.stm_line_background(
@@ -177,6 +190,29 @@ def apply_processing_state(arr: np.ndarray, state: ProcessingState) -> np.ndarra
                 int(p.get("x_px", 0)),
                 patch=int(p.get("patch", 1)),
             )
+        elif step.op == "roi":
+            try:
+                nested = ProcessingStep.from_dict(p.get("step", {}))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if nested.op not in _ROI_ELIGIBLE_OPS:
+                continue
+            rect = p.get("rect", ())
+            try:
+                x0, y0, x1, y1 = [int(v) for v in rect]
+            except (TypeError, ValueError):
+                continue
+            Ny, Nx = a.shape
+            x0 = max(0, min(Nx - 1, x0))
+            x1 = max(0, min(Nx - 1, x1))
+            y0 = max(0, min(Ny - 1, y0))
+            y1 = max(0, min(Ny - 1, y1))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            crop = a[y0:y1 + 1, x0:x1 + 1]
+            processed = apply_processing_state(crop, ProcessingState(steps=[nested]))
+            a = a.copy()
+            a[y0:y1 + 1, x0:x1 + 1] = processed
         else:
             raise ValueError(
                 f"Unknown processing operation {step.op!r}. "

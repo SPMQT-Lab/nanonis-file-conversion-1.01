@@ -19,6 +19,7 @@ NUMERIC_PROC_KEYS: tuple[str, ...] = (
     "align_rows",
     "bg_order",
     "bg_step_tolerance",
+    "background_fit_rect",
     "stm_line_bg",
     "facet_level",
     "smooth_sigma",
@@ -27,6 +28,8 @@ NUMERIC_PROC_KEYS: tuple[str, ...] = (
     "fft_soft_border",
     "linear_undistort",
     "set_zero_xy",
+    "processing_scope",
+    "roi_rect",
 )
 
 
@@ -43,33 +46,62 @@ def processing_state_from_gui(gui_state: dict) -> "ProcessingState":
 
     steps = []
 
+    roi_scope = gui_state.get("processing_scope") == "roi"
+    roi_eligible = {"smooth", "edge_detect", "fourier_filter", "fft_soft_border"}
+    roi_rect = None
+    if roi_scope:
+        try:
+            roi_rect = tuple(int(v) for v in gui_state.get("roi_rect", ()))
+            if len(roi_rect) != 4:
+                roi_rect = None
+        except (TypeError, ValueError):
+            roi_rect = None
+
+    def _append_step(step: ProcessingStep):
+        if roi_rect is not None and step.op in roi_eligible:
+            steps.append(ProcessingStep("roi", {
+                "rect": roi_rect,
+                "step": {"op": step.op, "params": dict(step.params)},
+            }))
+        else:
+            steps.append(step)
+
     if gui_state.get("remove_bad_lines"):
-        steps.append(ProcessingStep("remove_bad_lines", {"threshold_mad": 5.0}))
+        _append_step(ProcessingStep("remove_bad_lines", {"threshold_mad": 5.0}))
 
     align = gui_state.get("align_rows")
     if align:
-        steps.append(ProcessingStep("align_rows", {"method": str(align)}))
+        _append_step(ProcessingStep("align_rows", {"method": str(align)}))
 
     bg_order = gui_state.get("bg_order")
     if bg_order is not None:
-        steps.append(ProcessingStep("plane_bg", {
+        params = {
             "order": int(bg_order),
             "step_tolerance": bool(gui_state.get("bg_step_tolerance", False)),
-        }))
+        }
+        fit_rect = gui_state.get("background_fit_rect")
+        if fit_rect is not None:
+            try:
+                fit_rect_tuple = tuple(int(v) for v in fit_rect)
+                if len(fit_rect_tuple) == 4:
+                    params["fit_rect"] = fit_rect_tuple
+            except (TypeError, ValueError):
+                pass
+        _append_step(ProcessingStep("plane_bg", params))
 
     if gui_state.get("stm_line_bg") == "step_tolerant":
-        steps.append(ProcessingStep("stm_line_bg", {"mode": "step_tolerant"}))
+        _append_step(ProcessingStep("stm_line_bg", {"mode": "step_tolerant"}))
 
     if gui_state.get("facet_level"):
-        steps.append(ProcessingStep("facet_level", {"threshold_deg": 3.0}))
+        _append_step(ProcessingStep("facet_level", {"threshold_deg": 3.0}))
 
     smooth_sigma = gui_state.get("smooth_sigma")
     if smooth_sigma:
-        steps.append(ProcessingStep("smooth", {"sigma_px": float(smooth_sigma)}))
+        _append_step(ProcessingStep("smooth", {"sigma_px": float(smooth_sigma)}))
 
     edge_method = gui_state.get("edge_method")
     if edge_method:
-        steps.append(ProcessingStep("edge_detect", {
+        _append_step(ProcessingStep("edge_detect", {
             "method": str(edge_method),
             "sigma":  float(gui_state.get("edge_sigma",  1.0)),
             "sigma2": float(gui_state.get("edge_sigma2", 2.0)),
@@ -77,14 +109,14 @@ def processing_state_from_gui(gui_state: dict) -> "ProcessingState":
 
     fft_mode = gui_state.get("fft_mode")
     if fft_mode is not None:
-        steps.append(ProcessingStep("fourier_filter", {
+        _append_step(ProcessingStep("fourier_filter", {
             "mode":   str(fft_mode),
             "cutoff": float(gui_state.get("fft_cutoff", 0.10)),
             "window": str(gui_state.get("fft_window",   "hanning")),
         }))
 
     if gui_state.get("fft_soft_border"):
-        steps.append(ProcessingStep("fft_soft_border", {
+        _append_step(ProcessingStep("fft_soft_border", {
             "mode":        str(gui_state.get("fft_soft_mode",        "low_pass")),
             "cutoff":      float(gui_state.get("fft_soft_cutoff",      0.10)),
             "border_frac": float(gui_state.get("fft_soft_border_frac", 0.12)),
@@ -94,7 +126,7 @@ def processing_state_from_gui(gui_state: dict) -> "ProcessingState":
         shear_x = float(gui_state.get("undistort_shear_x", 0.0))
         scale_y = float(gui_state.get("undistort_scale_y", 1.0))
         if shear_x != 0.0 or scale_y != 1.0:
-            steps.append(ProcessingStep("linear_undistort", {
+            _append_step(ProcessingStep("linear_undistort", {
                 "shear_x": shear_x,
                 "scale_y": scale_y,
             }))
@@ -103,7 +135,7 @@ def processing_state_from_gui(gui_state: dict) -> "ProcessingState":
     if set_zero is not None:
         try:
             x_px, y_px = int(set_zero[0]), int(set_zero[1])
-            steps.append(ProcessingStep("set_zero_point", {
+            _append_step(ProcessingStep("set_zero_point", {
                 "x_px":  x_px,
                 "y_px":  y_px,
                 "patch": int(gui_state.get("set_zero_patch", 1)),
