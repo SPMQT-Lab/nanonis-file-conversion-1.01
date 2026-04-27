@@ -21,13 +21,13 @@ from PySide6.QtCore import (
     Qt, QObject, QRect, QRunnable, QThreadPool, QTimer, QSize, Signal, Slot,
 )
 from PySide6.QtGui import (
-    QBrush, QColor, QCursor, QFont, QImage, QMovie, QPainter, QPen,
+    QAction, QBrush, QColor, QCursor, QFont, QImage, QMovie, QPainter, QPen,
     QPixmap, QWheelEvent,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
     QDialog, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
     QRadioButton, QScrollArea, QSlider, QSplitter, QStackedWidget,
     QStatusBar, QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit,
     QToolTip, QVBoxLayout, QWidget,
@@ -253,15 +253,19 @@ class VertFile:
 
 
 def _card_meta_str(entry: SxmFile) -> str:
-    """Format key physical parameters for the thumbnail card label."""
+    """Format key physical parameters for the thumbnail card label.
+
+    Labels V and I explicitly so a missing setpoint reads as ``I: ?`` rather
+    than silently disappearing — that ambiguity confused users who couldn't
+    tell whether a low-current value was missing or just zero.
+    """
     line1 = "  |  ".join(filter(None, [
         f"{entry.Nx}×{entry.Ny}" if entry.Nx > 0 else "",
         f"{entry.scan_nm:.1f} nm" if entry.scan_nm is not None else "",
     ]))
-    line2 = "  |  ".join(filter(None, [
-        f"{entry.bias_mv:.0f} mV"    if entry.bias_mv    is not None else "",
-        f"{entry.current_pa:.0f} pA" if entry.current_pa is not None else "",
-    ]))
+    v_str = f"V: {entry.bias_mv:.0f} mV"    if entry.bias_mv    is not None else "V: ?"
+    i_str = f"I: {entry.current_pa:.0f} pA" if entry.current_pa is not None else "I: ?"
+    line2 = f"{v_str}  |  {i_str}"
     return "\n".join(filter(None, [line1, line2]))
 
 
@@ -788,6 +792,7 @@ class ScanCard(QFrame):
     """Single thumbnail card. Supports single-click, Ctrl+click, and double-click."""
     clicked        = Signal(object, bool)  # SxmFile, ctrl_held
     double_clicked = Signal(object)        # SxmFile
+    context_action_requested = Signal(object, str)  # SxmFile, action key
 
     CARD_W = 200
     CARD_H = 220
@@ -871,6 +876,25 @@ class ScanCard(QFrame):
         if event.button() == Qt.LeftButton:
             self.double_clicked.emit(self.entry)
         super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        a_features = QAction("Send to Features", self)
+        a_features.triggered.connect(
+            lambda: self.context_action_requested.emit(self.entry, "features"))
+        menu.addAction(a_features)
+
+        a_meta_csv = QAction("Export metadata as CSV…", self)
+        a_meta_csv.triggered.connect(
+            lambda: self.context_action_requested.emit(self.entry, "export_metadata_csv"))
+        menu.addAction(a_meta_csv)
+
+        a_meta_show = QAction("Show full metadata", self)
+        a_meta_show.triggered.connect(
+            lambda: self.context_action_requested.emit(self.entry, "show_metadata"))
+        menu.addAction(a_meta_show)
+
+        menu.exec(event.globalPos())
 
 
 # ── SpecCard ──────────────────────────────────────────────────────────────────
@@ -979,6 +1003,7 @@ class ThumbnailGrid(QWidget):
     entry_selected    = Signal(object)   # primary SxmFile for sidebar
     selection_changed = Signal(int)      # count of selected items
     view_requested    = Signal(object)   # SxmFile to open in full-size viewer
+    card_context_action = Signal(object, str)  # entry, action key — re-emitted from cards
 
     GAP = 10
 
@@ -1084,6 +1109,7 @@ class ThumbnailGrid(QWidget):
             else:
                 card = ScanCard(entry, self._t)
                 self._card_colormaps[entry.stem] = DEFAULT_CMAP_KEY
+                card.context_action_requested.connect(self.card_context_action)
             card.clicked.connect(self._on_card_click)
             card.double_clicked.connect(self._on_card_dbl)
             self._cards[entry.stem] = card
@@ -1224,6 +1250,39 @@ class ThumbnailGrid(QWidget):
                 count += 1
         return count
 
+    def reset_to_original(self, stems: set[str]) -> int:
+        """Drop ALL processing for the given stems and reload the raw thumbnail.
+
+        Pushes the prior state to the undo stack so the reset itself is
+        reversible. Colormap and clip percentiles are preserved; only the
+        numerical processing pipeline is cleared.
+        """
+        count = 0
+        token = self._load_token
+        for stem in stems:
+            entry = next((e for e in self._entries if e.stem == stem), None)
+            card  = self._cards.get(stem)
+            if not (entry and card and isinstance(entry, SxmFile)):
+                continue
+            prev_cmap = self._card_colormaps.get(stem, DEFAULT_CMAP_KEY)
+            prev_clip = self._card_clip.get(stem, (1.0, 99.0))
+            prev_proc = self._card_processing.get(stem, {})
+            if not prev_proc:
+                continue  # already raw — nothing to reset
+            stack = self._history.setdefault(stem, [])
+            stack.append((prev_cmap, prev_clip[0], prev_clip[1], dict(prev_proc)))
+            if len(stack) > self.HISTORY_MAX:
+                del stack[0:len(stack) - self.HISTORY_MAX]
+            self._card_processing[stem] = {}
+            loader = ThumbnailLoader(entry, prev_cmap, token,
+                                     ScanCard.IMG_W, ScanCard.IMG_H,
+                                     prev_clip[0], prev_clip[1],
+                                     processing=None)
+            loader.signals.loaded.connect(self._on_thumb)
+            self._pool.start(loader)
+            count += 1
+        return count
+
     def get_entries(self) -> list[Union[SxmFile, VertFile]]:
         return self._entries
 
@@ -1349,6 +1408,210 @@ class ThumbnailGrid(QWidget):
             i += 1
 
 
+# ── Physical-axis ruler (top / left of the image) ───────────────────────────
+class RulerWidget(QWidget):
+    """Thin tick-mark ruler showing physical nm extent of the image.
+
+    Placed in the scroll viewport alongside the image so it scrolls/zooms
+    in step with it. ``orientation`` is "horizontal" (top, runs left→right)
+    or "vertical" (left, runs top→bottom).
+    """
+
+    THICKNESS_PX = 26  # height for horizontal, width for vertical
+
+    def __init__(self, orientation: str = "horizontal", parent=None):
+        super().__init__(parent)
+        if orientation not in ("horizontal", "vertical"):
+            raise ValueError(f"orientation must be 'horizontal' or 'vertical', got {orientation!r}")
+        self._orient = orientation
+        self._scan_nm: float = 0.0
+        self._extent_px: int = 0  # image pixel extent in this direction
+        if orientation == "horizontal":
+            self.setFixedHeight(self.THICKNESS_PX)
+        else:
+            self.setFixedWidth(self.THICKNESS_PX)
+
+    def set_extent(self, scan_nm: float, extent_px: int) -> None:
+        """Bind to scan physical size and current pixmap extent (px)."""
+        self._scan_nm = float(scan_nm) if scan_nm and scan_nm > 0 else 0.0
+        self._extent_px = max(0, int(extent_px))
+        if self._orient == "horizontal":
+            self.setFixedWidth(max(1, self._extent_px))
+        else:
+            self.setFixedHeight(max(1, self._extent_px))
+        self.update()
+
+    @staticmethod
+    def _nice_step(scan_nm: float) -> float:
+        """Pick a tick step roughly scan/5, snapped to {1, 2, 5} × 10^k."""
+        if scan_nm <= 0:
+            return 1.0
+        target = scan_nm / 5.0
+        import math
+        exp = math.floor(math.log10(target))
+        base = target / (10 ** exp)
+        if base < 1.5:
+            mult = 1
+        elif base < 3.5:
+            mult = 2
+        elif base < 7.5:
+            mult = 5
+        else:
+            mult = 10
+        return mult * (10 ** exp)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._scan_nm <= 0 or self._extent_px <= 0:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor("#cdd6f4"), 1))
+        painter.setFont(QFont("Helvetica", 7))
+
+        step = self._nice_step(self._scan_nm)
+        if step <= 0:
+            painter.end()
+            return
+        n_steps = int(self._scan_nm / step) + 1
+
+        if self._orient == "horizontal":
+            # Border line at bottom of the ruler.
+            y_baseline = self.height() - 1
+            painter.drawLine(0, y_baseline, self.width(), y_baseline)
+            for i in range(n_steps + 1):
+                nm = i * step
+                if nm > self._scan_nm + 1e-9:
+                    break
+                x = int(round(nm / self._scan_nm * self._extent_px))
+                tick_h = 6 if i % 1 == 0 else 3
+                painter.drawLine(x, y_baseline - tick_h, x, y_baseline)
+                lbl = f"{nm:g}"
+                fm = painter.fontMetrics()
+                w = fm.horizontalAdvance(lbl)
+                tx = max(0, min(self.width() - w, x - w // 2))
+                painter.drawText(tx, y_baseline - tick_h - 2, lbl)
+            # Unit label at far right, drawn against the right edge.
+            unit = "nm"
+            fm = painter.fontMetrics()
+            uw = fm.horizontalAdvance(unit)
+            painter.drawText(self.width() - uw - 2, y_baseline - 2, unit)
+        else:  # vertical
+            x_baseline = self.width() - 1
+            painter.drawLine(x_baseline, 0, x_baseline, self.height())
+            for i in range(n_steps + 1):
+                nm = i * step
+                if nm > self._scan_nm + 1e-9:
+                    break
+                y = int(round(nm / self._scan_nm * self._extent_px))
+                tick_w = 6 if i % 1 == 0 else 3
+                painter.drawLine(x_baseline - tick_w, y, x_baseline, y)
+                lbl = f"{nm:g}"
+                fm = painter.fontMetrics()
+                h = fm.height()
+                # Right-align label to the tick start.
+                w = fm.horizontalAdvance(lbl)
+                tx = max(0, x_baseline - tick_w - 2 - w)
+                ty = max(h, min(self.height(), y + h // 2 - 1))
+                painter.drawText(tx, ty, lbl)
+        painter.end()
+
+
+# ── Scale-bar widget (lives below the image, separate from the pixmap) ──────
+class ScaleBarWidget(QWidget):
+    """Independent scale bar drawn underneath the image (not on the pixmap).
+
+    Defaults to an integer-nm length computed as roughly 20-30% of the scan
+    width, rounded down to the nearest integer nm. The user can override that
+    with a custom value (which can be any positive integer nm). Hidden when
+    ``visible`` is False; nothing is painted at all in that case.
+    """
+
+    BAR_HEIGHT_PX = 6
+    LABEL_GAP_PX  = 4
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scan_nm: float = 0.0
+        self._image_pixel_width: int = 0
+        self._visible: bool = False
+        self._custom_nm: Optional[float] = None  # None → auto integer length
+        self.setFixedHeight(28)
+        self.setMinimumWidth(40)
+
+    def set_scan_size(self, scan_nm: float, image_pixel_width: int) -> None:
+        """Tell the widget the scan's physical width and the on-screen width
+        of the image pixmap (so the bar can be sized in proportion).
+        """
+        self._scan_nm = float(scan_nm) if scan_nm and scan_nm > 0 else 0.0
+        self._image_pixel_width = max(0, int(image_pixel_width))
+        self.update()
+
+    def set_visible(self, visible: bool) -> None:
+        self._visible = bool(visible)
+        self.update()
+
+    def set_custom_length_nm(self, length_nm: Optional[float]) -> None:
+        """Override the auto length. Pass None to revert to auto."""
+        if length_nm is None or length_nm <= 0:
+            self._custom_nm = None
+        else:
+            self._custom_nm = float(length_nm)
+        self.update()
+
+    def auto_length_nm(self) -> float:
+        """Default integer-nm bar length (~25% of scan), floored to integer."""
+        if self._scan_nm <= 0:
+            return 0.0
+        target = self._scan_nm * 0.25
+        if target >= 1.0:
+            return float(int(target))  # floor to integer nm
+        # Sub-nm: fall back to a single nm if scan_nm >= 1, else just half.
+        if self._scan_nm >= 1.0:
+            return 1.0
+        return max(0.1, round(self._scan_nm * 0.25, 2))
+
+    def current_length_nm(self) -> float:
+        if self._custom_nm is not None:
+            return self._custom_nm
+        return self.auto_length_nm()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if (not self._visible) or self._scan_nm <= 0 or self._image_pixel_width <= 0:
+            return
+        length_nm = self.current_length_nm()
+        if length_nm <= 0 or length_nm > self._scan_nm:
+            return
+        bar_px = int(round(length_nm / self._scan_nm * self._image_pixel_width))
+        if bar_px <= 0:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Centre the bar horizontally over the image (image is centered in
+        # the scroll area by Qt.AlignCenter; we approximate by centering on
+        # this widget's full width — close enough since the widget is set
+        # to match the scroll area width).
+        x0 = (self.width() - bar_px) // 2
+        y0 = 4
+        painter.setPen(QPen(QColor("white"), 0))
+        painter.setBrush(QBrush(QColor("black")))
+        painter.drawRect(x0, y0, bar_px, self.BAR_HEIGHT_PX)
+
+        # Label "X nm" centred below.
+        if length_nm == int(length_nm):
+            txt = f"{int(length_nm)} nm"
+        else:
+            txt = f"{length_nm:g} nm"
+        painter.setPen(QPen(QColor("black"), 0))
+        painter.setFont(QFont("Helvetica", 10, QFont.Bold))
+        painter.drawText(QRect(x0, y0 + self.BAR_HEIGHT_PX + self.LABEL_GAP_PX,
+                                bar_px, 16),
+                         Qt.AlignCenter, txt)
+        painter.end()
+
+
 # ── Full-size image viewer dialog ─────────────────────────────────────────────
 class _ZoomLabel(QLabel):
     """QLabel inside a scroll area that supports Ctrl+Wheel zoom and spec-position markers."""
@@ -1356,6 +1619,7 @@ class _ZoomLabel(QLabel):
     marker_clicked = Signal(object)  # emits VertFile when user clicks a marker
     pixel_clicked  = Signal(float, float)  # (frac_x, frac_y) — only when set_zero_mode is on
     roi_selected   = Signal(float, float, float, float)  # fractional x0, y0, x1, y1
+    pixmap_resized = Signal(int)  # new pixmap width in pixels (zoom changes, source changes)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1364,6 +1628,7 @@ class _ZoomLabel(QLabel):
         self._zoom = 1.0
         self._markers: list[dict] = []   # each: {frac_x, frac_y, entry}
         self._show_markers: bool = True
+        self._zero_markers: list[dict] = []  # each: {frac_x, frac_y, label}
         self._set_zero_mode: bool = False
         self._roi_mode: bool = False
         self._roi_start = None
@@ -1434,6 +1699,15 @@ class _ZoomLabel(QLabel):
         self._show_markers = visible
         self.update()
 
+    def set_zero_markers(self, markers: list[dict]):
+        """Mark click locations used for set-zero / set-zero-plane interaction.
+
+        Each marker is a dict with ``frac_x``, ``frac_y`` in [0,1] and a
+        ``label`` string drawn inside the dot.
+        """
+        self._zero_markers = list(markers or [])
+        self.update()
+
     def _apply_zoom(self):
         if self._pixmap_orig is None:
             return
@@ -1444,6 +1718,7 @@ class _ZoomLabel(QLabel):
         self.setPixmap(scaled)
         self.resize(scaled.size())
         self.update()
+        self.pixmap_resized.emit(scaled.width())
 
     def _marker_px(self, frac_x: float, frac_y: float) -> tuple[int, int]:
         """Fractional image coords → label pixel coords."""
@@ -1477,6 +1752,25 @@ class _ZoomLabel(QLabel):
                 painter.setPen(QPen(QColor("black")))
                 painter.drawText(QRect(sx - r, sy - r, 2 * r, 2 * r),
                                  Qt.AlignCenter, str(i + 1))
+        if self._zero_markers:
+            r = 8
+            for m in self._zero_markers:
+                sx, sy = self._marker_px(m["frac_x"], m["frac_y"])
+                # Cross hairs for precision, then a filled dot on top.
+                painter.setPen(QPen(QColor(0, 0, 0, 200), 1))
+                painter.drawLine(sx - r - 4, sy, sx - r, sy)
+                painter.drawLine(sx + r, sy, sx + r + 4, sy)
+                painter.drawLine(sx, sy - r - 4, sx, sy - r)
+                painter.drawLine(sx, sy + r, sx, sy + r + 4)
+                painter.setBrush(QBrush(QColor("#22D3EE")))  # cyan
+                painter.setPen(QPen(QColor("black"), 1.5))
+                painter.drawEllipse(sx - r, sy - r, 2 * r, 2 * r)
+                label = str(m.get("label", ""))
+                if label:
+                    painter.setFont(QFont("Helvetica", 6, QFont.Bold))
+                    painter.setPen(QPen(QColor("black")))
+                    painter.drawText(QRect(sx - r, sy - r, 2 * r, 2 * r),
+                                     Qt.AlignCenter, label)
         roi_rect = self._roi_drag_rect or self._roi_rect_from_frac()
         if roi_rect is not None:
             painter.setBrush(QBrush(QColor(137, 180, 250, 45)))
@@ -1935,7 +2229,8 @@ class ImageViewerDialog(QDialog):
     def __init__(self, entry: SxmFile, entries: list[SxmFile],
                  colormap: str, t: dict, parent=None,
                  clip_low: float = 1.0, clip_high: float = 99.0,
-                 processing: dict = None):
+                 processing: dict = None,
+                 spec_image_map: Optional[dict] = None):
         super().__init__(parent)
         self.setWindowTitle(entry.stem)
         self.setMinimumSize(960, 680)
@@ -1951,6 +2246,9 @@ class ImageViewerDialog(QDialog):
         self._clip_high  = clip_high
         self._drs        = DisplayRangeState(low_pct=clip_low, high_pct=clip_high)
         self._processing = dict(processing) if processing else {}
+        # Mutable mapping shared with the parent window: spec_stem → image_stem.
+        # Empty dict by default — markers only appear after explicit mapping.
+        self._spec_image_map = spec_image_map if spec_image_map is not None else {}
         self._raw_arr: Optional[np.ndarray] = None
         self._display_arr: Optional[np.ndarray] = None  # raw or processed, for histogram/export
         self._spec_markers: list[dict] = []
@@ -1993,8 +2291,26 @@ class ImageViewerDialog(QDialog):
         self._scroll_area.setAlignment(Qt.AlignCenter)
         self._zoom_lbl = _ZoomLabel()
         self._zoom_lbl.setText("Loading…")
-        self._scroll_area.setWidget(self._zoom_lbl)
+
+        # Rulers scroll together with the image (placed in the same scroll
+        # viewport via a small grid container).
+        self._ruler_top  = RulerWidget("horizontal")
+        self._ruler_left = RulerWidget("vertical")
+        ruler_corner = QWidget()
+        ruler_corner.setFixedSize(RulerWidget.THICKNESS_PX, RulerWidget.THICKNESS_PX)
+        ruler_container = QWidget()
+        ruler_grid = QGridLayout(ruler_container)
+        ruler_grid.setContentsMargins(0, 0, 0, 0)
+        ruler_grid.setSpacing(0)
+        ruler_grid.addWidget(ruler_corner,    0, 0)
+        ruler_grid.addWidget(self._ruler_top, 0, 1)
+        ruler_grid.addWidget(self._ruler_left, 1, 0)
+        ruler_grid.addWidget(self._zoom_lbl,  1, 1)
+        self._scroll_area.setWidget(ruler_container)
         left_lay.addWidget(self._scroll_area, 1)
+
+        self._scale_bar = ScaleBarWidget()
+        left_lay.addWidget(self._scale_bar)
 
         zoom_row = QHBoxLayout()
         zoom_out_btn = QPushButton("−")
@@ -2104,7 +2420,14 @@ class ImageViewerDialog(QDialog):
         auto_btn.setFixedHeight(22)
         auto_btn.setToolTip("Reset to 1%–99% percentile autoscale")
         auto_btn.clicked.connect(self._on_auto_clip)
+        hist_export_btn = QPushButton("Export histogram…")
+        hist_export_btn.setFont(QFont("Helvetica", 8))
+        hist_export_btn.setFixedHeight(22)
+        hist_export_btn.setToolTip(
+            "Save the current histogram (bin centres + counts) as a tab-separated text file.")
+        hist_export_btn.clicked.connect(self._on_export_histogram)
         auto_row.addStretch()
+        auto_row.addWidget(hist_export_btn)
         auto_row.addWidget(auto_btn)
         right_lay.addLayout(auto_row)
 
@@ -2196,6 +2519,15 @@ class ImageViewerDialog(QDialog):
         proc_apply_btn.clicked.connect(self._on_apply_processing)
         processing_lay.addWidget(proc_apply_btn)
 
+        proc_reset_btn = QPushButton("Reset to original")
+        proc_reset_btn.setFont(QFont("Helvetica", 8))
+        proc_reset_btn.setFixedHeight(24)
+        proc_reset_btn.setToolTip(
+            "Discard all processing (background, FFT, smoothing, set-zero, …) "
+            "and reload the raw on-disk data for the current image.")
+        proc_reset_btn.clicked.connect(self._on_reset_processing)
+        processing_lay.addWidget(proc_reset_btn)
+
         self._processing_widget.setVisible(False)
         right_lay.addWidget(self._processing_widget)
 
@@ -2208,12 +2540,55 @@ class ImageViewerDialog(QDialog):
 
         right_lay.addWidget(_sep())
 
+        # ── Scale bar (drawn under the image, not on it) ───────────────────────
+        sb_lbl = QLabel("Scale bar")
+        sb_lbl.setFont(QFont("Helvetica", 9, QFont.Bold))
+        right_lay.addWidget(sb_lbl)
+
+        self._scale_bar_cb = QCheckBox("Show scale bar")
+        self._scale_bar_cb.setFont(QFont("Helvetica", 8))
+        self._scale_bar_cb.setChecked(False)
+        self._scale_bar_cb.toggled.connect(self._on_scale_bar_toggled)
+        right_lay.addWidget(self._scale_bar_cb)
+
+        sb_custom_row = QHBoxLayout()
+        self._sb_custom_cb = QCheckBox("Custom length (nm):")
+        self._sb_custom_cb.setFont(QFont("Helvetica", 8))
+        self._sb_custom_cb.setToolTip(
+            "Override the auto integer-nm length with a custom value. "
+            "Leave unchecked for an automatically chosen integer length.")
+        self._sb_custom_cb.toggled.connect(self._on_sb_custom_toggled)
+        self._sb_custom_spin = QDoubleSpinBox()
+        self._sb_custom_spin.setRange(0.01, 100000.0)
+        self._sb_custom_spin.setDecimals(2)
+        self._sb_custom_spin.setSingleStep(1.0)
+        self._sb_custom_spin.setValue(1.0)
+        self._sb_custom_spin.setFixedWidth(80)
+        self._sb_custom_spin.setEnabled(False)
+        self._sb_custom_spin.valueChanged.connect(self._on_sb_custom_value_changed)
+        sb_custom_row.addWidget(self._sb_custom_cb)
+        sb_custom_row.addWidget(self._sb_custom_spin)
+        sb_custom_row.addStretch()
+        right_lay.addLayout(sb_custom_row)
+
+        right_lay.addWidget(_sep())
+
         # spec position overlay toggle
         self._spec_show_cb = QCheckBox("Show spec positions")
         self._spec_show_cb.setFont(QFont("Helvetica", 8))
         self._spec_show_cb.setChecked(True)
         self._spec_show_cb.toggled.connect(self._on_spec_show_toggled)
         right_lay.addWidget(self._spec_show_cb)
+
+        self._map_spectra_here_btn = QPushButton("Map spectra to this image…")
+        self._map_spectra_here_btn.setFont(QFont("Helvetica", 8))
+        self._map_spectra_here_btn.setFixedHeight(24)
+        self._map_spectra_here_btn.setToolTip(
+            "Pick which spectroscopy files in this folder belong to the "
+            "currently displayed image. Markers are drawn at each spectrum's "
+            "recorded (x,y) position.")
+        self._map_spectra_here_btn.clicked.connect(self._on_map_spectra_here)
+        right_lay.addWidget(self._map_spectra_here_btn)
 
         # Manual zeroing lives outside the automatic background controls on
         # purpose. Future background/plane tools may offer an explicit
@@ -2242,6 +2617,7 @@ class ImageViewerDialog(QDialog):
         self._zoom_lbl.marker_clicked.connect(self._on_marker_clicked)
         self._zoom_lbl.pixel_clicked.connect(self._on_set_zero_pick)
         self._zoom_lbl.roi_selected.connect(self._on_roi_selected)
+        self._zoom_lbl.pixmap_resized.connect(self._on_pixmap_resized)
 
         right_lay.addWidget(_sep())
 
@@ -2448,23 +2824,41 @@ class ImageViewerDialog(QDialog):
 
     # ── Spec position overlay ─────────────────────────────────────────────────
     def _load_spec_markers(self, entry):
-        """Scan the image's parent folder for spec files and set markers."""
-        from probeflow.file_type import FileType, sniff_file_type
-        from probeflow.spec_io import read_spec_file
-        from probeflow.spec_plot import spec_position_to_pixel, _parse_sxm_offset
+        """Show markers ONLY for spec files explicitly mapped to this image.
 
+        Coordinate-based auto-matching used to be done here, but it
+        attached spectra to the wrong scans for users with overlapping
+        scan windows. Use the "Map spectra…" dialogs (folder-level on the
+        toolbar, or per-image inside this viewer) to establish the
+        spec→image mapping explicitly. Without a mapping, no markers
+        appear — that's intentional, not a bug.
+        """
         self._spec_markers = []
         self._zoom_lbl.set_markers([])
 
         if self._scan_range_m is None or self._scan_shape is None:
             return
 
+        # Walk the spec→image mapping; only specs assigned to this stem are
+        # candidates. We still need their coordinates to position the marker.
+        from probeflow.file_type import FileType, sniff_file_type
+        from probeflow.spec_io import read_spec_file
+        from probeflow.spec_plot import spec_position_to_pixel, _parse_sxm_offset
+
         try:
             folder = entry.path.parent
+            assigned_specs = {
+                spec_stem for spec_stem, img_stem in self._spec_image_map.items()
+                if img_stem == entry.stem
+            }
+            if not assigned_specs:
+                return
             spec_types = (FileType.CREATEC_SPEC, FileType.NANONIS_SPEC)
             candidates = [
                 f for f in sorted(folder.iterdir())
-                if f.is_file() and sniff_file_type(f) in spec_types
+                if f.is_file()
+                   and f.stem in assigned_specs
+                   and sniff_file_type(f) in spec_types
             ]
 
             if self._scan_format == "sxm" and self._scan_header:
@@ -2491,8 +2885,13 @@ class ImageViewerDialog(QDialog):
                         scan_angle_deg=scan_angle_deg,
                     )
                     if result is None:
-                        continue
-                    frac_x, frac_y = result
+                        # User explicitly mapped this spec to this image, but
+                        # the coordinates don't actually fall in-frame. Show
+                        # the marker anyway, clamped to the centre, so the
+                        # user can see the assignment exists.
+                        frac_x, frac_y = 0.5, 0.5
+                    else:
+                        frac_x, frac_y = result
                     markers.append({
                         "frac_x": frac_x,
                         "frac_y": frac_y,
@@ -2517,6 +2916,37 @@ class ImageViewerDialog(QDialog):
             self._zoom_lbl.set_markers(self._spec_markers)
         else:
             self._zoom_lbl.set_markers([])
+
+    def _on_map_spectra_here(self):
+        """Open the per-image spec→this-image mapping dialog."""
+        entry = self._entries[self._idx]
+        # Find sibling .VERT files in the same folder.
+        from probeflow.file_type import FileType, sniff_file_type
+        try:
+            spec_paths = sorted(
+                f for f in entry.path.parent.iterdir()
+                if f.is_file() and sniff_file_type(f) in (
+                    FileType.CREATEC_SPEC, FileType.NANONIS_SPEC)
+            )
+        except Exception:
+            spec_paths = []
+        if not spec_paths:
+            self._status_lbl.setText(
+                "No spectroscopy files found alongside this image.")
+            return
+        # Build minimal VertFile placeholders (read_spec_file is slow; the
+        # dialog only needs the stem).
+        vert_entries = [VertFile(path=p, stem=p.stem) for p in spec_paths]
+        dlg = ViewerSpecMappingDialog(
+            entry.stem, vert_entries, self._spec_image_map, self)
+        if dlg.exec() == QDialog.Accepted:
+            new_map = dlg.updated_map()
+            self._spec_image_map.clear()
+            self._spec_image_map.update(new_map)
+            n_for_this = sum(1 for v in new_map.values() if v == entry.stem)
+            self._status_lbl.setText(
+                f"{n_for_this} spec(s) mapped to this image. Reloading markers…")
+            self._load_spec_markers(entry)
 
     def _on_marker_clicked(self, entry):
         dlg = SpecViewerDialog(entry, self._t, self)
@@ -2603,6 +3033,7 @@ class ImageViewerDialog(QDialog):
         if self._zero_pick_mode == "plane" and self._set_zero_plane_btn.isChecked():
             self._zero_plane_points_px.append((x_px, y_px))
             n = len(self._zero_plane_points_px)
+            self._refresh_zero_markers()  # show partial pick immediately
             if n < 3:
                 self._status_lbl.setText(
                     f"Zero plane point {n}/3 set at ({x_px}, {y_px}); click {3 - n} more."
@@ -2626,6 +3057,40 @@ class ImageViewerDialog(QDialog):
         self._status_lbl.setText(f"Zero offset set at pixel ({x_px}, {y_px})")
         self._load_current()
 
+    def _refresh_zero_markers(self):
+        """Push the current set-zero pick state into _ZoomLabel for drawing.
+
+        Sources, in order of priority:
+          1. In-progress plane picks (``self._zero_plane_points_px``).
+          2. Committed plane points (``processing['set_zero_plane_points']``).
+          3. Committed single-point zero (``processing['set_zero_xy']``).
+        """
+        if self._raw_arr is None:
+            self._zoom_lbl.set_zero_markers([])
+            return
+        Ny, Nx = self._raw_arr.shape
+        denom_x = max(1, Nx - 1)
+        denom_y = max(1, Ny - 1)
+
+        def _to_marker(pt, label):
+            x_px, y_px = pt
+            return {
+                "frac_x": float(x_px) / denom_x,
+                "frac_y": float(y_px) / denom_y,
+                "label": label,
+            }
+
+        markers: list[dict] = []
+        if self._zero_plane_points_px:
+            for i, pt in enumerate(self._zero_plane_points_px[:3]):
+                markers.append(_to_marker(pt, str(i + 1)))
+        elif self._processing.get("set_zero_plane_points"):
+            for i, pt in enumerate(self._processing["set_zero_plane_points"][:3]):
+                markers.append(_to_marker(pt, str(i + 1)))
+        elif self._processing.get("set_zero_xy") is not None:
+            markers.append(_to_marker(self._processing["set_zero_xy"], "0"))
+        self._zoom_lbl.set_zero_markers(markers)
+
     def _on_clear_set_zero(self):
         had_zero = any(k in self._processing for k in ("set_zero_xy", "set_zero_plane_points"))
         self._processing.pop('set_zero_xy', None)
@@ -2637,6 +3102,7 @@ class ImageViewerDialog(QDialog):
         if self._set_zero_plane_btn.isChecked():
             self._set_zero_plane_btn.setChecked(False)
         self._status_lbl.setText("Zero references cleared")
+        self._refresh_zero_markers()
         if had_zero:
             self._load_current()
 
@@ -2715,6 +3181,40 @@ class ImageViewerDialog(QDialog):
         self._high_sl.blockSignals(False)
         self._load_current()
 
+    def _on_export_histogram(self):
+        """Save the current histogram (bin centres + counts) as a TSV file."""
+        flat = self._hist_flat_phys
+        if flat is None or flat.size < 2:
+            self._status_lbl.setText("No histogram data to export.")
+            return
+        entry = self._entries[self._idx]
+        unit = self._hist_unit or ""
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export histogram",
+            str(Path.home() / f"{entry.stem}_histogram.txt"),
+            "Text files (*.txt *.tsv *.csv)",
+        )
+        if not out_path:
+            return
+        try:
+            n_bins = 256
+            counts, edges = np.histogram(flat, bins=n_bins)
+            centres = 0.5 * (edges[:-1] + edges[1:])
+            with open(out_path, "w", encoding="utf-8") as fh:
+                fh.write(f"# ProbeFlow histogram export\n")
+                fh.write(f"# source: {entry.stem}\n")
+                fh.write(f"# channel: {self._ch_cb.currentText()}\n")
+                fh.write(f"# n_samples: {flat.size}\n")
+                fh.write(f"# n_bins: {n_bins}\n")
+                fh.write(f"# unit: {unit}\n")
+                fh.write(f"bin_center_{unit}\tcount\n")
+                for c, n in zip(centres, counts):
+                    fh.write(f"{c:.8g}\t{int(n)}\n")
+            self._status_lbl.setText(f"Histogram → {out_path}")
+        except Exception as exc:
+            self._status_lbl.setText(f"Export error: {exc}")
+
     def _on_channel_changed(self, _: int):
         # Different channels have different physical units — reset manual limits.
         self._drs.reset(self._clip_low, self._clip_high)
@@ -2726,6 +3226,55 @@ class ImageViewerDialog(QDialog):
             return
         self._zoom_lbl.setText("")
         self._zoom_lbl.set_source(pixmap)
+        self._refresh_zero_markers()
+        self._refresh_scale_bar()
+
+    # ── Scale-bar slots ────────────────────────────────────────────────────────
+    def _on_scale_bar_toggled(self, on: bool):
+        self._scale_bar.set_visible(bool(on))
+
+    def _on_sb_custom_toggled(self, on: bool):
+        self._sb_custom_spin.setEnabled(bool(on))
+        if on:
+            self._scale_bar.set_custom_length_nm(self._sb_custom_spin.value())
+        else:
+            self._scale_bar.set_custom_length_nm(None)
+
+    def _on_sb_custom_value_changed(self, v: float):
+        if self._sb_custom_cb.isChecked():
+            self._scale_bar.set_custom_length_nm(float(v))
+
+    def _scan_extent_nm(self) -> tuple[float, float]:
+        """Return (width_nm, height_nm) for the current scan, or (0,0)."""
+        if self._scan_range_m is None:
+            return 0.0, 0.0
+        try:
+            w_nm = float(self._scan_range_m[0]) * 1e9
+            h_nm = float(self._scan_range_m[1]) * 1e9
+        except (TypeError, ValueError, IndexError):
+            return 0.0, 0.0
+        return max(0.0, w_nm), max(0.0, h_nm)
+
+    def _refresh_scale_bar(self):
+        """Re-bind the scale bar + axes rulers to current scan/pixmap dimensions."""
+        w_nm, h_nm = self._scan_extent_nm()
+        pix = self._zoom_lbl.pixmap()
+        if pix is not None and not pix.isNull():
+            pw, ph = pix.width(), pix.height()
+        else:
+            pw = ph = 0
+        self._scale_bar.set_scan_size(w_nm, pw)
+        self._ruler_top.set_extent(w_nm, pw)
+        self._ruler_left.set_extent(h_nm, ph)
+
+    def _on_pixmap_resized(self, new_width_px: int):
+        # The signal carries width only — read height off the pixmap directly.
+        pix = self._zoom_lbl.pixmap()
+        new_h = pix.height() if pix is not None and not pix.isNull() else 0
+        w_nm, h_nm = self._scan_extent_nm()
+        self._scale_bar.set_scan_size(w_nm, new_width_px)
+        self._ruler_top.set_extent(w_nm, new_width_px)
+        self._ruler_left.set_extent(h_nm, new_h)
 
     # ── Controls ───────────────────────────────────────────────────────────────
     def _on_periodic_filter(self):
@@ -2790,6 +3339,24 @@ class ImageViewerDialog(QDialog):
             self._processing.pop("patch_interpolate_iterations", None)
         self._load_current()
 
+    def _on_reset_processing(self):
+        """Clear all processing for the current image and reload raw data."""
+        if not self._processing:
+            self._status_lbl.setText("Already showing the original — nothing to reset.")
+            return
+        self._processing = {}
+        self._processing_panel.set_state({})
+        # Untoggle any active set-zero pick modes so we don't re-pick on reload.
+        if self._set_zero_btn.isChecked():
+            self._set_zero_btn.setChecked(False)
+        if self._set_zero_plane_btn.isChecked():
+            self._set_zero_plane_btn.setChecked(False)
+        self._zero_plane_points_px = []
+        self._roi_rect_px = None
+        self._refresh_zero_markers()
+        self._status_lbl.setText("Reset: showing original on-disk data.")
+        self._load_current()
+
     def _on_save_png(self):
         entry = self._entries[self._idx]
         out_path, _ = QFileDialog.getSaveFileName(
@@ -2838,6 +3405,248 @@ class ImageViewerDialog(QDialog):
             self._status_lbl.setText(f"Export error: {exc}")
 
 
+# ── Spec → image mapping dialogs ─────────────────────────────────────────────
+class SpecMappingDialog(QDialog):
+    """Folder-level spec→image mapping editor.
+
+    Lists every loaded .VERT spec file with a dropdown of every loaded
+    .sxm image in the same folder (plus a leading "(none)" entry). The
+    user picks the parent image for each spectrum; the result is returned
+    as a ``dict[spec_stem, image_stem]`` containing only the assigned
+    rows. Unassigned spectra are simply omitted from the result.
+
+    A "Suggest all" button populates dropdowns by reading each scan's
+    physical extent (offset, range, angle) and picking the smallest
+    image whose scan-frame contains the spec's recorded coordinates.
+    The suggestion is just a starting point — the user can change any
+    row before accepting.
+    """
+
+    NONE_LABEL = "(none)"
+
+    def __init__(self, sxm_entries: list, vert_entries: list,
+                 current_map: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Map spectra to images")
+        self.resize(720, 520)
+        self._sxm_entries = list(sxm_entries)
+        self._vert_entries = list(vert_entries)
+        self._current = dict(current_map or {})
+        self._combos: dict[str, QComboBox] = {}
+        self._build()
+
+    def _build(self):
+        v = QVBoxLayout(self)
+        v.setContentsMargins(12, 12, 12, 12)
+        v.setSpacing(8)
+
+        hdr = QLabel(
+            "Pick the parent image for each spectrum. Unassigned spectra "
+            "show no marker on any image.")
+        hdr.setFont(QFont("Helvetica", 10))
+        hdr.setWordWrap(True)
+        v.addWidget(hdr)
+
+        if not self._vert_entries:
+            v.addWidget(QLabel("No spectroscopy files in the current folder."))
+        else:
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            inner = QWidget()
+            grid = QGridLayout(inner)
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(12)
+            grid.setVerticalSpacing(4)
+            grid.addWidget(QLabel("Spectrum"), 0, 0)
+            grid.addWidget(QLabel("Parent image"), 0, 1)
+
+            image_options = [self.NONE_LABEL] + [e.stem for e in self._sxm_entries]
+            for i, vert in enumerate(self._vert_entries, start=1):
+                grid.addWidget(QLabel(vert.stem), i, 0)
+                cb = QComboBox()
+                cb.addItems(image_options)
+                cur = self._current.get(vert.stem)
+                if cur and cur in image_options:
+                    cb.setCurrentText(cur)
+                else:
+                    cb.setCurrentText(self.NONE_LABEL)
+                grid.addWidget(cb, i, 1)
+                self._combos[vert.stem] = cb
+            grid.setColumnStretch(1, 1)
+            scroll.setWidget(inner)
+            v.addWidget(scroll, 1)
+
+        # Action row
+        btn_row = QHBoxLayout()
+        suggest_btn = QPushButton("Suggest all (by coordinates)")
+        suggest_btn.setToolTip(
+            "For each spectrum, look at its recorded (x,y) position and pick "
+            "the smallest loaded scan whose frame contains it. Existing "
+            "selections are overwritten.")
+        suggest_btn.clicked.connect(self._on_suggest)
+        btn_row.addWidget(suggest_btn)
+        clear_btn = QPushButton("Clear all")
+        clear_btn.clicked.connect(self._on_clear_all)
+        btn_row.addWidget(clear_btn)
+        btn_row.addStretch()
+        ok_btn = QPushButton("Apply")
+        ok_btn.setObjectName("accentBtn")
+        ok_btn.clicked.connect(self.accept)
+        btn_row.addWidget(ok_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        v.addLayout(btn_row)
+
+    def _on_clear_all(self):
+        for cb in self._combos.values():
+            cb.setCurrentText(self.NONE_LABEL)
+
+    def _on_suggest(self):
+        """Pick the smallest containing image per spec, by coordinate."""
+        # We avoid importing this at module top because it pulls in scan I/O
+        # — keeping the dialog responsive on large folders matters more
+        # than saving the import here.
+        from probeflow.spec_io import read_spec_file
+        from probeflow.spec_plot import spec_position_to_pixel, _parse_sxm_offset
+
+        # Pre-load image headers once (slow if many files).
+        scan_info = []
+        for img in self._sxm_entries:
+            try:
+                _scan = load_scan(img.path)
+                shape = _scan.planes[0].shape if _scan.planes else None
+                if shape is None or _scan.scan_range_m is None:
+                    continue
+                hdr = _scan.header or {}
+                offset_m = (0.0, 0.0)
+                angle_deg = 0.0
+                if img.source_format == "sxm" and hdr:
+                    offset_m = _parse_sxm_offset(hdr)
+                    raw = hdr.get("SCAN_ANGLE", "0").strip()
+                    try:
+                        angle_deg = float(raw) if raw else 0.0
+                    except ValueError:
+                        angle_deg = 0.0
+                # "Size" used to break ties when several images contain a spec:
+                # smaller scan range = better localisation = preferred.
+                rng_m = _scan.scan_range_m
+                area_m2 = float(rng_m[0]) * float(rng_m[1])
+                scan_info.append((img.stem, shape, rng_m, offset_m, angle_deg, area_m2))
+            except Exception:
+                continue
+
+        for vert in self._vert_entries:
+            try:
+                spec = read_spec_file(vert.path)
+                x_m, y_m = spec.position
+            except Exception:
+                continue
+            best: Optional[tuple[float, str]] = None  # (area, stem)
+            for stem, shape, rng_m, offset_m, angle_deg, area in scan_info:
+                hit = spec_position_to_pixel(
+                    x_m, y_m,
+                    scan_shape=shape,
+                    scan_range_m=rng_m,
+                    scan_offset_m=offset_m,
+                    scan_angle_deg=angle_deg,
+                )
+                if hit is None:
+                    continue
+                if best is None or area < best[0]:
+                    best = (area, stem)
+            if best is not None and vert.stem in self._combos:
+                self._combos[vert.stem].setCurrentText(best[1])
+
+    def get_mapping(self) -> dict[str, str]:
+        """Return the user's selection as ``{spec_stem: image_stem}``."""
+        out: dict[str, str] = {}
+        for spec_stem, cb in self._combos.items():
+            sel = cb.currentText()
+            if sel and sel != self.NONE_LABEL:
+                out[spec_stem] = sel
+        return out
+
+
+class ViewerSpecMappingDialog(QDialog):
+    """In-viewer mapping editor for ONE image.
+
+    Lists all .VERT spec files in the same folder; the user ticks which
+    spectra belong to the currently displayed image. Multiple images can
+    share a parent in principle (e.g. different planes of the same scan)
+    but our mapping is one-to-one, so ticking a spec here moves it from
+    any prior parent to the current image.
+    """
+
+    def __init__(self, image_stem: str, vert_entries: list,
+                 current_map: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Map spectra to {image_stem}")
+        self.resize(420, 460)
+        self._image_stem  = image_stem
+        self._vert_entries = list(vert_entries)
+        self._current     = dict(current_map or {})
+        self._checks: dict[str, QCheckBox] = {}
+        self._build()
+
+    def _build(self):
+        v = QVBoxLayout(self)
+        v.setContentsMargins(12, 12, 12, 12)
+        v.setSpacing(6)
+        hdr = QLabel(
+            f"Tick the spectra to associate with <b>{self._image_stem}</b>. "
+            "Ticking one that is already mapped to a different image will move it.")
+        hdr.setFont(QFont("Helvetica", 9))
+        hdr.setWordWrap(True)
+        v.addWidget(hdr)
+
+        if not self._vert_entries:
+            v.addWidget(QLabel("No .VERT files in the current folder."))
+        else:
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            inner = QWidget()
+            inner_lay = QVBoxLayout(inner)
+            inner_lay.setContentsMargins(0, 0, 0, 0)
+            inner_lay.setSpacing(2)
+            for vert in self._vert_entries:
+                cb = QCheckBox(vert.stem)
+                cb.setChecked(self._current.get(vert.stem) == self._image_stem)
+                # Annotate other-image assignments so the user knows what
+                # ticking this row will displace.
+                other = self._current.get(vert.stem)
+                if other and other != self._image_stem:
+                    cb.setText(f"{vert.stem}   (currently → {other})")
+                inner_lay.addWidget(cb)
+                self._checks[vert.stem] = cb
+            inner_lay.addStretch()
+            scroll.setWidget(inner)
+            v.addWidget(scroll, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        ok_btn = QPushButton("Apply")
+        ok_btn.setObjectName("accentBtn")
+        ok_btn.clicked.connect(self.accept)
+        btn_row.addWidget(ok_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        v.addLayout(btn_row)
+
+    def updated_map(self) -> dict[str, str]:
+        """Return a NEW mapping dict reflecting the user's choices."""
+        out = dict(self._current)
+        for spec_stem, cb in self._checks.items():
+            if cb.isChecked():
+                out[spec_stem] = self._image_stem
+            else:
+                # Only clear if this row WAS pointing at the current image.
+                if out.get(spec_stem) == self._image_stem:
+                    out.pop(spec_stem, None)
+        return out
+
+
 # ── Browse tool panel (LEFT) ──────────────────────────────────────────────────
 class BrowseToolPanel(QWidget):
     """Left-side control panel: folder, colormap, scale, processing, export."""
@@ -2849,6 +3658,8 @@ class BrowseToolPanel(QWidget):
     autoclip_requested         = Signal()
     export_requested           = Signal()
     undo_requested             = Signal()
+    reset_requested            = Signal()
+    map_spectra_requested      = Signal()
     filter_changed             = Signal(str)   # "all" | "images" | "spectra"
 
     def __init__(self, t: dict, cfg: dict, parent=None):
@@ -3023,11 +3834,33 @@ class BrowseToolPanel(QWidget):
         self._undo_btn.clicked.connect(self.undo_requested.emit)
         proc_lay.addWidget(self._undo_btn)
 
+        self._reset_btn = QPushButton("⟲ Reset to original (clear all filters)")
+        self._reset_btn.setFont(QFont("Helvetica", 8))
+        self._reset_btn.setFixedHeight(26)
+        self._reset_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._reset_btn.setToolTip(
+            "Discard all processing (background, FFT, smoothing, set-zero, …) "
+            "for the selected images and reload the raw on-disk data. "
+            "Colormap and clip range are preserved. Reversible via Undo.")
+        self._reset_btn.clicked.connect(self.reset_requested.emit)
+        proc_lay.addWidget(self._reset_btn)
+
         lay.addWidget(self._proc_widget)
         self._proc_widget.setVisible(False)
         lay.addWidget(_sep())
 
         # ── Export ─────────────────────────────────────────────────────────────
+        self._map_spectra_btn = QPushButton("Map spectra to images\u2026")
+        self._map_spectra_btn.setFont(QFont("Helvetica", 9))
+        self._map_spectra_btn.setFixedHeight(28)
+        self._map_spectra_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._map_spectra_btn.setToolTip(
+            "Pick the parent image for each .VERT spectrum in the current "
+            "folder. Spectra without a mapping show no marker on any image. "
+            "You can also map per-image inside the viewer.")
+        self._map_spectra_btn.clicked.connect(self.map_spectra_requested.emit)
+        lay.addWidget(self._map_spectra_btn)
+
         self._export_btn = QPushButton("\u2b07 Export PNG\u2026")
         self._export_btn.setFont(QFont("Helvetica", 9, QFont.Bold))
         self._export_btn.setFixedHeight(30)
@@ -3169,18 +4002,29 @@ class BrowseInfoPanel(QWidget):
         lay.addLayout(ch_grid)
         lay.addWidget(_sep())
 
-        meta_hdr_row = QHBoxLayout()
-        meta_hdr = QLabel("Metadata")
-        meta_hdr.setFont(QFont("Helvetica", 11, QFont.Bold))
+        # Full metadata is hidden behind a toggle. The quick-info grid above
+        # (Pixels / Size / Bias / Setpoint) is what users want at a glance;
+        # the full header table is dense and only useful occasionally.
+        self._meta_toggle = QPushButton("[+] Show all metadata")
+        self._meta_toggle.setFont(QFont("Helvetica", 9, QFont.Bold))
+        self._meta_toggle.setFixedHeight(24)
+        self._meta_toggle.setCursor(QCursor(Qt.PointingHandCursor))
+        self._meta_toggle.setToolTip(
+            "Expand to show the full scan header (also accessible via "
+            "right-click → Show full metadata).")
+        self._meta_toggle.clicked.connect(self._toggle_meta)
+        lay.addWidget(self._meta_toggle)
+
+        self._meta_widget = QWidget()
+        meta_lay = QVBoxLayout(self._meta_widget)
+        meta_lay.setContentsMargins(0, 4, 0, 0)
+        meta_lay.setSpacing(4)
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("Search…")
         self.search_box.setFont(QFont("Helvetica", 10))
         self.search_box.setFixedHeight(28)
         self.search_box.textChanged.connect(self._filter_meta)
-        meta_hdr_row.addWidget(meta_hdr)
-        meta_hdr_row.addStretch()
-        meta_hdr_row.addWidget(self.search_box)
-        lay.addLayout(meta_hdr_row)
+        meta_lay.addWidget(self.search_box)
 
         self.meta_table = QTableWidget(0, 2)
         self.meta_table.setHorizontalHeaderLabels(["Parameter", "Value"])
@@ -3193,7 +4037,15 @@ class BrowseInfoPanel(QWidget):
         self.meta_table.setFont(QFont("Helvetica", 10))
         self.meta_table.verticalHeader().setDefaultSectionSize(22)
         self.meta_table.setShowGrid(False)
-        lay.addWidget(self.meta_table, 1)
+        meta_lay.addWidget(self.meta_table, 1)
+        self._meta_widget.setVisible(False)
+        lay.addWidget(self._meta_widget, 1)
+
+    def _toggle_meta(self):
+        vis = not self._meta_widget.isVisible()
+        self._meta_widget.setVisible(vis)
+        self._meta_toggle.setText(
+            "[-] Hide all metadata" if vis else "[+] Show all metadata")
 
     # ── Public API ─────────────────────────────────────────────────────────────
     def show_entry(self, entry: SxmFile, colormap_key: str,
@@ -3457,6 +4309,23 @@ class SpecViewerDialog(QDialog):
         self._raw_btn.setFixedWidth(140)
         self._raw_btn.clicked.connect(self._show_raw_data)
         btn_row.addWidget(self._raw_btn)
+
+        self._export_csv_btn = QPushButton("Export CSV…")
+        self._export_csv_btn.setFixedWidth(120)
+        self._export_csv_btn.setToolTip(
+            "Save the spectrum as a CSV file with one column per selected channel.")
+        self._export_csv_btn.clicked.connect(self._export_csv)
+        btn_row.addWidget(self._export_csv_btn)
+
+        self._export_grace_btn = QPushButton("Export xmgrace…")
+        self._export_grace_btn.setFixedWidth(160)
+        self._export_grace_btn.setToolTip(
+            "Render via xmgrace (Helvetica default). "
+            "Produces three files in the chosen folder: "
+            ".agr (re-editable Grace project), .png, and .pdf.")
+        self._export_grace_btn.clicked.connect(self._export_xmgrace)
+        btn_row.addWidget(self._export_grace_btn)
+
         btn_row.addStretch()
         close_btn = QPushButton("Close")
         close_btn.setFixedWidth(80)
@@ -3574,6 +4443,110 @@ class SpecViewerDialog(QDialog):
         self._canvas_lay.addWidget(canvas)
         self._canvas = canvas
         self._fig = fig
+
+    # ── Export ──────────────────────────────────────────────────────────
+
+    def _selected_channels_in_display_units(self):
+        """Yield (ch, y_disp, disp_unit) for each ticked channel.
+
+        Applies the user's unit override (or auto-pick) so the exported
+        values match what's currently shown in the plot.
+        """
+        from .spec_plot import choose_display_unit, lookup_unit_scale
+
+        spec = self._spec
+        if spec is None:
+            return
+        for ch, cb in self._checkboxes.items():
+            if not cb.isChecked() or ch not in spec.channels:
+                continue
+            y = np.asarray(spec.channels[ch], dtype=float)
+            unit = spec.y_units.get(ch, "")
+            choice = self._unit_choice.get(unit, "Auto")
+            override = lookup_unit_scale(unit, choice) if choice != "Auto" else None
+            if override is not None:
+                scale, disp_unit = override
+            else:
+                scale, disp_unit = choose_display_unit(unit, y)
+            yield ch, y * scale, disp_unit
+
+    def _export_csv(self) -> None:
+        if self._spec is None:
+            self._status.setText("Nothing to export — spectrum failed to load.")
+            return
+        rows = list(self._selected_channels_in_display_units())
+        if not rows:
+            self._status.setText("Tick at least one channel before exporting.")
+            return
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "Export spectrum CSV",
+            str(Path.home() / f"{self._entry.stem}.csv"),
+            "CSV files (*.csv)")
+        if not out_path:
+            return
+        try:
+            import csv
+            x = self._spec.x_array
+            with open(out_path, "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow([self._spec.x_label]
+                           + [f"{ch} ({u})" if u else ch for ch, _, u in rows])
+                for i in range(len(x)):
+                    w.writerow([f"{x[i]:.10g}"]
+                               + [f"{y[i]:.10g}" for _, y, _ in rows])
+            self._status.setText(f"CSV → {out_path}")
+        except Exception as exc:
+            self._status.setText(f"CSV export error: {exc}")
+
+    def _export_xmgrace(self) -> None:
+        if self._spec is None:
+            self._status.setText("Nothing to export — spectrum failed to load.")
+            return
+        rows = list(self._selected_channels_in_display_units())
+        if not rows:
+            self._status.setText("Tick at least one channel before exporting.")
+            return
+        out_dir = QFileDialog.getExistingDirectory(
+            self, "Choose output folder for xmgrace export",
+            str(Path.home()))
+        if not out_dir:
+            return
+        try:
+            from .xmgrace_export import Curve, export_bundle
+        except ImportError as exc:
+            self._status.setText(f"xmgrace export unavailable: {exc}")
+            return
+        # Group all channels under one Y axis label if they share a unit;
+        # otherwise we keep the legend per-channel and a generic "value" label.
+        units = {u for _, _, u in rows}
+        if len(units) == 1:
+            y_label = f"value ({rows[0][2]})" if rows[0][2] else "value"
+        else:
+            y_label = "value"
+        curves = [
+            Curve(name=ch, y=y, legend=f"{ch} ({u})" if u else ch)
+            for ch, y, u in rows
+        ]
+        try:
+            paths = export_bundle(
+                Path(out_dir),
+                self._entry.stem,
+                self._spec.x_array,
+                curves,
+                x_label=self._spec.x_label,
+                y_label=y_label,
+                title=self._entry.stem,
+                subtitle="ProbeFlow xmgrace export",
+                font="Helvetica",
+            )
+        except FileNotFoundError as exc:
+            self._status.setText(f"Export error: {exc}")
+            return
+        except Exception as exc:
+            self._status.setText(f"xmgrace failed: {exc}")
+            return
+        names = ", ".join(p.name for p in paths.values())
+        self._status.setText(f"Exported to {out_dir}: {names}")
 
     # ── Raw-data table ──────────────────────────────────────────────────
 
@@ -4115,6 +5088,11 @@ class ProbeFlowWindow(QMainWindow):
         self._mode     = "browse"
         self._running  = False
         self._n_loaded = 0
+        # Spec → image mapping (populated by user via "Map spectra…" dialogs;
+        # kept empty by default so we never auto-attach spectra to the wrong
+        # image based on coordinate guesses alone). Keys are spec stems,
+        # values are image stems within the currently loaded folder.
+        self._spec_image_map: dict[str, str] = {}
 
         self._build_ui()
         self._apply_theme()
@@ -4204,6 +5182,7 @@ class ProbeFlowWindow(QMainWindow):
         self._grid.entry_selected.connect(self._on_entry_select)
         self._grid.selection_changed.connect(self._on_selection_changed)
         self._grid.view_requested.connect(self._open_viewer)
+        self._grid.card_context_action.connect(self._on_card_context_action)
         self._browse_tools.colormap_apply_requested.connect(self._on_apply_colormap)
         self._browse_tools.scale_changed.connect(self._on_scale_changed)
         self._browse_tools.processing_apply_requested.connect(self._on_processing_apply)
@@ -4211,6 +5190,8 @@ class ProbeFlowWindow(QMainWindow):
         self._browse_tools.autoclip_requested.connect(self._on_autoclip)
         self._browse_tools.export_requested.connect(self._on_export)
         self._browse_tools.undo_requested.connect(self._on_undo)
+        self._browse_tools.reset_requested.connect(self._on_reset)
+        self._browse_tools.map_spectra_requested.connect(self._on_map_spectra)
         self._browse_tools.filter_changed.connect(self._on_filter_changed)
         # Sync initial filter state from the toolbar into the grid so the
         # two agree even before the first folder is opened.
@@ -4295,6 +5276,8 @@ class ProbeFlowWindow(QMainWindow):
         entries = sorted(sxm_entries + vert_entries, key=lambda e: e.stem)
         self._grid.load(entries, folder_path=d)
         self._n_loaded = len(entries)
+        # New folder → discard previous spec mapping; user can rebuild it.
+        self._spec_image_map = {}
         n_sxm  = len(sxm_entries)
         n_vert = len(vert_entries)
         parts  = []
@@ -4457,6 +5440,119 @@ class ProbeFlowWindow(QMainWindow):
             self._status_bar.showMessage("Nothing to undo — no history for current selection")
         else:
             self._status_bar.showMessage(f"Undo applied to {n} image{'s' if n > 1 else ''}")
+
+    def _on_reset(self):
+        selected = self._grid.get_selected()
+        if not selected:
+            self._status_bar.showMessage("Select an image first to reset")
+            return
+        n = self._grid.reset_to_original(selected)
+        if n == 0:
+            self._status_bar.showMessage(
+                "Nothing to reset — selected images already have no processing applied")
+        else:
+            self._status_bar.showMessage(
+                f"Reset to original applied to {n} image{'s' if n > 1 else ''}")
+
+    def _on_map_spectra(self):
+        """Open the folder-level spec→image mapping dialog."""
+        entries = self._grid.get_entries()
+        sxm_entries  = [e for e in entries if isinstance(e, SxmFile)]
+        vert_entries = [e for e in entries if isinstance(e, VertFile)]
+        if not vert_entries:
+            self._status_bar.showMessage("No spectroscopy files in the current folder.")
+            return
+        if not sxm_entries:
+            self._status_bar.showMessage("No images loaded — open a folder with .sxm files first.")
+            return
+        dlg = SpecMappingDialog(sxm_entries, vert_entries, self._spec_image_map, self)
+        if dlg.exec() == QDialog.Accepted:
+            new_map = dlg.get_mapping()
+            self._spec_image_map.clear()
+            self._spec_image_map.update(new_map)
+            self._status_bar.showMessage(
+                f"Spec mapping updated: {len(new_map)} of "
+                f"{len(vert_entries)} spectra assigned.")
+
+    def _on_card_context_action(self, entry, action: str):
+        """Dispatch ScanCard right-click actions (Send to Features, export, show metadata)."""
+        if action == "features":
+            self._switch_mode("features")
+            try:
+                _scan = load_scan(entry.path)
+            except Exception as exc:
+                self._status_bar.showMessage(f"Could not read scan: {exc}")
+                return
+            plane_idx = self._features_sidebar.plane_index()
+            if plane_idx >= _scan.n_planes:
+                plane_idx = 0
+            arr = _scan.planes[plane_idx]
+            if arr is None:
+                self._status_bar.showMessage("Could not read scan plane.")
+                return
+            w_m, h_m = _scan.scan_range_m
+            Ny, Nx = arr.shape
+            if Nx <= 0 or Ny <= 0 or w_m <= 0 or h_m <= 0:
+                px_m = 1e-10
+            else:
+                px_m = float(np.sqrt((w_m / Nx) * (h_m / Ny)))
+            self._features_panel.load_entry(entry, plane_idx, arr, px_m)
+            self._features_sidebar.set_status(
+                f"Loaded {entry.stem} (plane {plane_idx})")
+            self._status_bar.showMessage(f"{entry.stem} sent to Features")
+
+        elif action == "export_metadata_csv":
+            try:
+                _scan = load_scan(entry.path)
+                header = dict(getattr(_scan, "header", {}) or {})
+            except Exception as exc:
+                self._status_bar.showMessage(f"Could not read scan: {exc}")
+                return
+            if not header:
+                self._status_bar.showMessage("No metadata to export")
+                return
+            out_path, _ = QFileDialog.getSaveFileName(
+                self, "Export metadata as CSV",
+                str(Path.home() / f"{entry.stem}_metadata.csv"),
+                "CSV files (*.csv)")
+            if not out_path:
+                return
+            try:
+                import csv
+                with open(out_path, "w", newline="", encoding="utf-8") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(["key", "value"])
+                    for k in sorted(header):
+                        w.writerow([k, header[k]])
+                self._status_bar.showMessage(f"Metadata → {out_path}")
+            except Exception as exc:
+                self._status_bar.showMessage(f"Export error: {exc}")
+
+        elif action == "show_metadata":
+            try:
+                _scan = load_scan(entry.path)
+                header = dict(getattr(_scan, "header", {}) or {})
+            except Exception as exc:
+                self._status_bar.showMessage(f"Could not read scan: {exc}")
+                return
+            dlg = QDialog(self)
+            dlg.setWindowTitle(f"Metadata — {entry.stem}")
+            dlg.resize(560, 600)
+            v = QVBoxLayout(dlg)
+            tbl = QTableWidget(len(header), 2, dlg)
+            tbl.setHorizontalHeaderLabels(["Key", "Value"])
+            tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            tbl.verticalHeader().setVisible(False)
+            tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            tbl.setFont(QFont("Helvetica", 9))
+            for row, k in enumerate(sorted(header)):
+                tbl.setItem(row, 0, QTableWidgetItem(str(k)))
+                tbl.setItem(row, 1, QTableWidgetItem(str(header[k])))
+            v.addWidget(tbl)
+            close_btn = QPushButton("Close", dlg)
+            close_btn.clicked.connect(dlg.accept)
+            v.addWidget(close_btn)
+            dlg.exec()
 
     def _on_export(self):
         primary = self._grid.get_primary()
@@ -4682,7 +5778,8 @@ class ProbeFlowWindow(QMainWindow):
             sxm_entries = [e for e in self._grid.get_entries() if isinstance(e, SxmFile)]
             dlg = ImageViewerDialog(entry, sxm_entries, cmap_key, t, self,
                                     clip_low=clip[0], clip_high=clip[1],
-                                    processing=proc)
+                                    processing=proc,
+                                    spec_image_map=self._spec_image_map)
             dlg.exec()
 
     # ── Convert ────────────────────────────────────────────────────────────────

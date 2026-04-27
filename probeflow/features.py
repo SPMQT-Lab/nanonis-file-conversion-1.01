@@ -38,14 +38,28 @@ import numpy as np
 
 # ─── Lazy imports ────────────────────────────────────────────────────────────
 
+def _missing_extra_message(pkg: str, import_name: str) -> str:
+    """Build a diagnostic error message for missing optional dependencies.
+
+    Includes the active interpreter so users can spot env mismatches —
+    the most common cause of "I already pip-installed it" reports.
+    """
+    import sys
+    return (
+        f"{pkg} is required for feature detection but `import {import_name}` failed.\n"
+        f"  Active interpreter: {sys.executable}\n"
+        f"  Python version:     {sys.version.split()[0]}\n"
+        f"Install into THIS interpreter with:\n"
+        f"  {sys.executable} -m pip install 'probeflow[features]'\n"
+        f"(Plain `pip install ...` may target a different environment.)"
+    )
+
+
 def _cv():
     try:
         import cv2
     except ImportError as exc:  # pragma: no cover - deps guard
-        raise ImportError(
-            "OpenCV is required for feature detection. Install with "
-            "`pip install probeflow[features]`."
-        ) from exc
+        raise ImportError(_missing_extra_message("OpenCV", "cv2")) from exc
     return cv2
 
 
@@ -53,10 +67,7 @@ def _sklearn():
     try:
         import sklearn  # noqa: F401
     except ImportError as exc:  # pragma: no cover - deps guard
-        raise ImportError(
-            "scikit-learn is required for classification. Install with "
-            "`pip install probeflow[features]`."
-        ) from exc
+        raise ImportError(_missing_extra_message("scikit-learn", "sklearn")) from exc
     import sklearn
     return sklearn
 
