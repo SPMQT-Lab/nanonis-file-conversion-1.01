@@ -107,7 +107,7 @@ class TestImageBrowserItems:
         assert image_browser_items([]) == []
 
 
-# ── Test A2: large Viewer rendering may upscale small scans ──────────────────
+# ── Test A2: large Viewer rendering preserves measured pixels ────────────────
 
 class TestViewerRenderSizing:
     def test_scan_thumbnail_does_not_upscale_by_default(self):
@@ -120,15 +120,14 @@ class TestViewerRenderSizing:
         assert img is not None
         assert img.size == (160, 160)
 
-    def test_viewer_render_can_upscale_small_scan_to_fit(self):
+    def test_viewer_render_defaults_to_native_pixel_size(self):
         img = render_scan_thumbnail(
             TESTDATA / "sxm_moire_10nm.sxm",
-            size=(900, 800),
-            allow_upscale=True,
+            size=None,
         )
 
         assert img is not None
-        assert img.size == (800, 800)
+        assert img.size == (160, 160)
 
     def test_viewer_ruler_layout_keeps_image_label_full_size(self, qapp, monkeypatch):
         from PySide6.QtGui import QPixmap
@@ -140,20 +139,20 @@ class TestViewerRenderSizing:
         dlg._scan_range_m = (10e-9, 10e-9)
         token = dlg._token
 
-        dlg._on_loaded(QPixmap(800, 800), token)
+        dlg._on_loaded(QPixmap(160, 160), token)
         qapp.processEvents()
 
-        assert dlg._zoom_lbl.size().width() == 800
-        assert dlg._zoom_lbl.size().height() == 800
-        assert dlg._ruler_container.sizeHint().width() >= 826
-        assert dlg._ruler_container.sizeHint().height() >= 826
-        assert dlg._ruler_container.size().width() >= 826
-        assert dlg._ruler_container.size().height() >= 826
+        assert dlg._zoom_lbl.size().width() == 160
+        assert dlg._zoom_lbl.size().height() == 160
+        assert dlg._ruler_container.sizeHint().width() >= 186
+        assert dlg._ruler_container.sizeHint().height() >= 186
+        assert dlg._ruler_container.size().width() >= 186
+        assert dlg._ruler_container.size().height() >= 186
 
         dlg.close()
         dlg.deleteLater()
 
-    def test_processed_viewer_render_can_upscale_small_scan_to_fit(self):
+    def test_processed_viewer_render_defaults_to_native_pixel_size(self):
         from probeflow.scan import load_scan
 
         scan = load_scan(TESTDATA / "sxm_moire_10nm.sxm")
@@ -163,12 +162,11 @@ class TestViewerRenderSizing:
             1.0,
             99.0,
             {"align_rows": "median"},
-            size=(900, 800),
-            allow_upscale=True,
+            size=None,
         )
 
         assert img is not None
-        assert img.size == (800, 800)
+        assert img.size == (160, 160)
 
 
 # ── Test B: split_indexed_items separates scans, spectra, errors ──────────────

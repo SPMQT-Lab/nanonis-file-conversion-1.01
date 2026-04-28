@@ -465,11 +465,9 @@ def render_with_processing(
 def _fit_image_to_box(img: Image.Image, size: tuple[int, int]) -> Image.Image:
     """Resize an image to fit inside ``size``, including upscaling.
 
-    Thumbnail cards intentionally avoid upscaling small scans. The large Viewer
-    is different: it should use the available screen real estate even for
-    160×160 Nanonis files. Keep that behavior explicit so future scale-bar or
-    ruler work does not accidentally route Viewer previews through
-    ``Image.thumbnail()``, which never enlarges.
+    Thumbnail-card preview paths can opt into this for presentation sizing.
+    The full scan viewer deliberately does not use it: measured image pixels
+    should open at native raster size and zoom without interpolation.
     """
     max_w, max_h = int(size[0]), int(size[1])
     if max_w <= 0 or max_h <= 0 or img.width <= 0 or img.height <= 0:
@@ -705,7 +703,8 @@ class ViewerSignals(QObject):
 
 
 class ViewerLoader(QRunnable):
-    def __init__(self, entry: SxmFile, colormap: str, token, w: int, h: int,
+    def __init__(self, entry: SxmFile, colormap: str, token,
+                 size: Optional[tuple[int, int]] = None,
                  plane_idx: int = 0, clip_low: float = 1.0,
                  clip_high: float = 99.0, processing: dict = None,
                  vmin: Optional[float] = None, vmax: Optional[float] = None):
@@ -715,8 +714,7 @@ class ViewerLoader(QRunnable):
         self.entry      = entry
         self.colormap   = colormap
         self.token      = token
-        self.w          = w
-        self.h          = h
+        self.size       = size
         self.plane_idx  = plane_idx
         self.clip_low   = clip_low
         self.clip_high  = clip_high
@@ -735,17 +733,17 @@ class ViewerLoader(QRunnable):
                 img = render_with_processing(arr, self.colormap,
                                              self.clip_low, self.clip_high,
                                              self.processing,
-                                             size=(self.w, self.h),
+                                             size=self.size,
                                              vmin=self.vmin, vmax=self.vmax,
-                                             allow_upscale=True)
+                                             allow_upscale=False)
             else:
                 img = None
         else:
             img = render_scan_thumbnail(self.entry.path, self.plane_idx,
                                         self.colormap, self.clip_low, self.clip_high,
-                                        size=(self.w, self.h),
+                                        size=self.size,
                                         vmin=self.vmin, vmax=self.vmax,
-                                        allow_upscale=True)
+                                        allow_upscale=False)
         if img is not None:
             self.signals.loaded.emit(pil_to_pixmap(img), self.token)
 
@@ -1745,8 +1743,11 @@ class _ZoomLabel(QLabel):
             return
         w = int(self._pixmap_orig.width()  * self._zoom)
         h = int(self._pixmap_orig.height() * self._zoom)
+        # SPM image pixels are measured samples, not presentation pixels.
+        # Preserve the raster honestly: 1:1 is native data size, and zoom uses
+        # nearest-neighbour style scaling instead of smoothing/interpolation.
         scaled = self._pixmap_orig.scaled(w, h, Qt.KeepAspectRatio,
-                                           Qt.SmoothTransformation)
+                                           Qt.FastTransformation)
         self.setPixmap(scaled)
         # The label sits inside a ruler QGridLayout. A plain resize() can be
         # overridden by the layout, leaving a large pixmap squeezed into a tiny
@@ -2770,7 +2771,7 @@ class ImageViewerDialog(QDialog):
         vmin, vmax = self._drs.resolve(self._display_arr) if self._display_arr is not None else (None, None)
         # load rendered image
         self._token = object()
-        loader = ViewerLoader(entry, self._colormap, self._token, 900, 800,
+        loader = ViewerLoader(entry, self._colormap, self._token, None,
                               self._ch_cb.currentIndex(),
                               self._clip_low, self._clip_high,
                               self._processing or None,
