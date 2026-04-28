@@ -24,7 +24,10 @@ from probeflow.gui import (
     _spec_items_to_vert,
     render_scan_thumbnail,
     render_with_processing,
+    resolve_thumbnail_plane_index,
+    THUMBNAIL_CHANNEL_DEFAULT,
     SxmFile,
+    ThumbnailGrid,
     VertFile,
 )
 
@@ -168,6 +171,125 @@ class TestViewerRenderSizing:
 
         assert img is not None
         assert img.size == (160, 160)
+
+
+class TestThumbnailChannelResolution:
+    def test_frequency_shift_forward_is_selected(self):
+        names = [
+            "Z forward",
+            "Z backward",
+            "Current forward",
+            "Current backward",
+            "OC M1 Freq. Shift forward",
+            "OC M1 Freq. Shift backward",
+        ]
+
+        assert resolve_thumbnail_plane_index(names, "Frequency shift") == 4
+
+    def test_backward_only_afm_channel_falls_back_to_z(self):
+        names = [
+            "Z forward",
+            "Z backward",
+            "OC M1 Freq. Shift backward",
+        ]
+
+        assert resolve_thumbnail_plane_index(names, "Frequency shift") == 0
+
+    def test_missing_channel_falls_back_to_plane_zero(self):
+        names = ["Z forward", "Z backward", "Current forward", "Current backward"]
+
+        assert resolve_thumbnail_plane_index(names, "Amplitude") == 0
+
+    def test_current_forward_is_selected(self):
+        names = ["Z forward", "Z backward", "Current forward", "Current backward"]
+
+        assert resolve_thumbnail_plane_index(names, "Current") == 2
+
+    def test_default_is_z(self):
+        names = ["Z forward", "Current forward"]
+
+        assert resolve_thumbnail_plane_index(names, THUMBNAIL_CHANNEL_DEFAULT) == 0
+
+
+class TestThumbnailGridChannelSelection:
+    def test_load_defaults_to_z_channel_for_scan_cards(self, qapp, monkeypatch):
+        import probeflow.gui as gui_mod
+
+        captured = []
+
+        class _Signal:
+            def connect(self, _slot):
+                pass
+
+        class _Signals:
+            loaded = _Signal()
+
+        class FakeThumbnailLoader:
+            def __init__(self, entry, colormap, token, w, h, *args, **kwargs):
+                captured.append((entry.stem, kwargs.get("thumbnail_channel")))
+                self.signals = _Signals()
+
+        class FakePool:
+            def start(self, _loader):
+                pass
+
+        monkeypatch.setattr(gui_mod, "ThumbnailLoader", FakeThumbnailLoader)
+        grid = ThumbnailGrid(gui_mod.THEMES["dark"])
+        grid._pool = FakePool()
+        entries = [
+            SxmFile(path=Path("a.sxm"), stem="a"),
+            VertFile(path=Path("spec.VERT"), stem="spec"),
+        ]
+
+        grid.load(entries)
+
+        assert captured == [("a", "Z")]
+
+        grid.close()
+        grid.deleteLater()
+
+    def test_changing_thumbnail_channel_rerenders_scan_cards(self, qapp, monkeypatch):
+        import probeflow.gui as gui_mod
+
+        captured = []
+
+        class _Signal:
+            def connect(self, _slot):
+                pass
+
+        class _Signals:
+            loaded = _Signal()
+
+        class FakeThumbnailLoader:
+            def __init__(self, entry, colormap, token, w, h, *args, **kwargs):
+                captured.append((entry.stem, kwargs.get("thumbnail_channel")))
+                self.signals = _Signals()
+
+        class FakePool:
+            def start(self, _loader):
+                pass
+
+        monkeypatch.setattr(gui_mod, "ThumbnailLoader", FakeThumbnailLoader)
+        grid = ThumbnailGrid(gui_mod.THEMES["dark"])
+        grid._pool = FakePool()
+        entries = [
+            SxmFile(path=Path("a.sxm"), stem="a"),
+            SxmFile(path=Path("b.sxm"), stem="b"),
+            VertFile(path=Path("spec.VERT"), stem="spec"),
+        ]
+        grid.load(entries)
+        captured.clear()
+
+        n = grid.set_thumbnail_channel("Frequency shift")
+
+        assert n == 2
+        assert captured == [
+            ("a", "Frequency shift"),
+            ("b", "Frequency shift"),
+        ]
+
+        grid.close()
+        grid.deleteLater()
 
 
 class TestSpecViewerRawData:

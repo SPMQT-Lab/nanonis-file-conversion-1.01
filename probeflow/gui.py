@@ -291,6 +291,80 @@ def clip_range_from_arr(
         return None, None
 
 
+THUMBNAIL_CHANNEL_OPTIONS = (
+    "Z",
+    "Current",
+    "Frequency shift",
+    "Amplitude",
+    "Drive",
+    "Dissipation",
+)
+THUMBNAIL_CHANNEL_DEFAULT = "Z"
+
+
+def _normalise_channel_name(name: str) -> str:
+    text = _re.sub(r"[_\-]+", " ", str(name).lower())
+    return _re.sub(r"\s+", " ", text).strip()
+
+
+def _is_forward_channel_name(name: str) -> bool:
+    norm = _normalise_channel_name(name)
+    if any(tok in norm for tok in ("backward", "bwd")):
+        return False
+    if any(tok in norm for tok in ("forward", "fwd")):
+        return True
+    return True
+
+
+def _matches_thumbnail_semantic(name: str, semantic: str) -> bool:
+    norm = _normalise_channel_name(name)
+    if not _is_forward_channel_name(norm):
+        return False
+    semantic = semantic if semantic in THUMBNAIL_CHANNEL_OPTIONS else THUMBNAIL_CHANNEL_DEFAULT
+    if semantic == "Z":
+        return (
+            norm == "z"
+            or norm.startswith("z ")
+            or "topography" in norm
+            or "height" in norm
+        )
+    if semantic == "Current":
+        return norm == "i" or norm.startswith("i ") or "current" in norm
+    if semantic == "Frequency shift":
+        return (
+            "freq" in norm
+            or "frequency" in norm
+            or "delta f" in norm
+            or "df" in norm
+        )
+    if semantic == "Amplitude":
+        return "amplitude" in norm or norm == "amp" or norm.startswith("amp ")
+    if semantic == "Drive":
+        return "drive" in norm or "excitation" in norm or norm == "exc" or norm.startswith("exc ")
+    if semantic == "Dissipation":
+        return "dissipation" in norm or norm == "diss" or norm.startswith("diss ")
+    return False
+
+
+def resolve_thumbnail_plane_index(
+    plane_names: list[str] | tuple[str, ...],
+    semantic: str = THUMBNAIL_CHANNEL_DEFAULT,
+) -> int:
+    """Return the best forward plane index for a browse-thumbnail semantic."""
+    names = list(plane_names or [])
+    if not names:
+        return 0
+    requested = semantic if semantic in THUMBNAIL_CHANNEL_OPTIONS else THUMBNAIL_CHANNEL_DEFAULT
+    for idx, name in enumerate(names):
+        if _matches_thumbnail_semantic(name, requested):
+            return idx
+    if requested != THUMBNAIL_CHANNEL_DEFAULT:
+        for idx, name in enumerate(names):
+            if _matches_thumbnail_semantic(name, THUMBNAIL_CHANNEL_DEFAULT):
+                return idx
+    return 0
+
+
 def _apply_processing(
     arr: np.ndarray,
     processing: dict,
@@ -304,6 +378,32 @@ def _apply_processing(
     """
     from probeflow.processing_state import apply_processing_state
     return apply_processing_state(arr, processing_state_from_gui(processing or {}))
+
+
+def _render_scan_array(
+    arr: np.ndarray,
+    colormap: str = "gray",
+    clip_low: float = 1.0,
+    clip_high: float = 99.0,
+    size: tuple | None = (148, 116),
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    allow_upscale: bool = False,
+) -> Optional[Image.Image]:
+    if vmin is None or vmax is None:
+        vmin, vmax = clip_range_from_arr(arr, clip_low, clip_high)
+    if vmin is None:
+        return None
+
+    u8 = _array_to_uint8(arr, vmin=vmin, vmax=vmax)
+    colored = _get_lut(colormap)[u8]
+    img = Image.fromarray(colored, mode="RGB")
+    if size:
+        if allow_upscale:
+            img = _fit_image_to_box(img, size)
+        else:
+            img.thumbnail(size, Image.LANCZOS)
+    return img
 
 
 def render_scan_thumbnail(
@@ -326,22 +426,9 @@ def render_scan_thumbnail(
         scan = load_scan(scan_path)
         if plane_idx >= scan.n_planes:
             return None
-        arr = scan.planes[plane_idx]
-
-        if vmin is None or vmax is None:
-            vmin, vmax = clip_range_from_arr(arr, clip_low, clip_high)
-        if vmin is None:
-            return None
-
-        u8      = _array_to_uint8(arr, vmin=vmin, vmax=vmax)
-        colored = _get_lut(colormap)[u8]
-        img     = Image.fromarray(colored, mode="RGB")
-        if size:
-            if allow_upscale:
-                img = _fit_image_to_box(img, size)
-            else:
-                img.thumbnail(size, Image.LANCZOS)
-        return img
+        return _render_scan_array(
+            scan.planes[plane_idx], colormap, clip_low, clip_high,
+            size=size, vmin=vmin, vmax=vmax, allow_upscale=allow_upscale)
     except Exception:
         return None
 
@@ -599,7 +686,8 @@ class ThumbnailSignals(QObject):
 class ThumbnailLoader(QRunnable):
     def __init__(self, entry: SxmFile, colormap: str, token, w: int, h: int,
                  clip_low: float = 1.0, clip_high: float = 99.0,
-                 processing: dict = None):
+                 processing: dict = None,
+                 thumbnail_channel: str = THUMBNAIL_CHANNEL_DEFAULT):
         super().__init__()
         self.setAutoDelete(True)
         self.signals    = ThumbnailSignals()
@@ -611,25 +699,35 @@ class ThumbnailLoader(QRunnable):
         self.clip_low   = clip_low
         self.clip_high  = clip_high
         self.processing = processing or {}
+        self.thumbnail_channel = thumbnail_channel
 
     def run(self):
-        if self.processing:
-            # Use raw array path so processing functions receive unscaled data
-            try:
-                scan = load_scan(self.entry.path)
-                arr = scan.planes[0] if scan.n_planes > 0 else None
-            except Exception:
-                arr = None
-            if arr is not None:
-                img = render_with_processing(
-                    arr, self.colormap, self.clip_low, self.clip_high,
-                    self.processing, size=(self.w, self.h))
+        try:
+            scan = load_scan(self.entry.path)
+            plane_idx = resolve_thumbnail_plane_index(
+                list(getattr(scan, "plane_names", []) or []),
+                self.thumbnail_channel,
+            )
+            arr = scan.planes[plane_idx] if plane_idx < scan.n_planes else None
+        except Exception:
+            arr = None
+        try:
+            if self.processing:
+                if arr is not None:
+                    img = render_with_processing(
+                        arr, self.colormap, self.clip_low, self.clip_high,
+                        self.processing, size=(self.w, self.h))
+                else:
+                    img = None
             else:
-                img = None
-        else:
-            img = render_scan_thumbnail(self.entry.path, 0, self.colormap,
-                                        self.clip_low, self.clip_high,
-                                        size=(self.w, self.h))
+                img = (
+                    _render_scan_array(
+                        arr, self.colormap, self.clip_low, self.clip_high,
+                        size=(self.w, self.h))
+                    if arr is not None else None
+                )
+        except Exception:
+            img = None
         if img is not None:
             self.signals.loaded.emit(self.entry.stem, pil_to_pixmap(img), self.token)
 
@@ -1082,6 +1180,7 @@ class ThumbnailGrid(QWidget):
         self._card_colormaps: dict[str, str]                   = {}
         self._card_processing: dict[str, dict]                 = {}   # current processing per stem
         self._card_clip:      dict[str, tuple[float, float]]   = {}   # current clip per stem
+        self._thumbnail_channel: str                           = THUMBNAIL_CHANNEL_DEFAULT
         # per-stem undo stack: list of (colormap, clip_low, clip_high, processing)
         self._history:        dict[str, list[tuple]]           = {}
         self._load_token                                       = object()
@@ -1156,7 +1255,8 @@ class ThumbnailGrid(QWidget):
                                              SpecCard.IMG_W, SpecCard.IMG_H)
             else:
                 loader = ThumbnailLoader(entry, DEFAULT_CMAP_KEY, token,
-                                         ScanCard.IMG_W, ScanCard.IMG_H)
+                                         ScanCard.IMG_W, ScanCard.IMG_H,
+                                         thumbnail_channel=self._thumbnail_channel)
             loader.signals.loaded.connect(self._on_thumb)
             self._pool.start(loader)
 
@@ -1191,10 +1291,46 @@ class ThumbnailGrid(QWidget):
                 loader = ThumbnailLoader(entry, colormap_key, token,
                                          ScanCard.IMG_W, ScanCard.IMG_H,
                                          clip_low, clip_high,
-                                         processing=processing)
+                                         processing=processing,
+                                         thumbnail_channel=self._thumbnail_channel)
                 loader.signals.loaded.connect(self._on_thumb)
                 self._pool.start(loader)
         return len(self._selected)
+
+    def set_thumbnail_channel(self, channel: str) -> int:
+        """Set the global browse thumbnail channel and re-render scan cards."""
+        if channel not in THUMBNAIL_CHANNEL_OPTIONS:
+            channel = THUMBNAIL_CHANNEL_DEFAULT
+        self._thumbnail_channel = channel
+        token = self._load_token
+        count = 0
+        for entry in self._entries:
+            if not isinstance(entry, SxmFile):
+                continue
+            if entry.stem not in self._cards:
+                continue
+            cmap = self._card_colormaps.get(entry.stem, DEFAULT_CMAP_KEY)
+            clip = self._card_clip.get(entry.stem, (1.0, 99.0))
+            proc = self._card_processing.get(entry.stem, {})
+            loader = ThumbnailLoader(entry, cmap, token,
+                                     ScanCard.IMG_W, ScanCard.IMG_H,
+                                     clip[0], clip[1],
+                                     processing=proc or None,
+                                     thumbnail_channel=self._thumbnail_channel)
+            loader.signals.loaded.connect(self._on_thumb)
+            self._pool.start(loader)
+            count += 1
+        return count
+
+    def thumbnail_channel(self) -> str:
+        return self._thumbnail_channel
+
+    def thumbnail_plane_index_for_entry(self, entry: SxmFile) -> int:
+        try:
+            scan = load_scan(entry.path)
+            return resolve_thumbnail_plane_index(scan.plane_names, self._thumbnail_channel)
+        except Exception:
+            return 0
 
     def set_processing_for_all_images(self, processing: dict,
                                       push_history: bool = True) -> int:
@@ -1222,7 +1358,8 @@ class ThumbnailGrid(QWidget):
             loader = ThumbnailLoader(entry, prev_cmap, token,
                                      ScanCard.IMG_W, ScanCard.IMG_H,
                                      prev_clip[0], prev_clip[1],
-                                     processing=processing or None)
+                                     processing=processing or None,
+                                     thumbnail_channel=self._thumbnail_channel)
             loader.signals.loaded.connect(self._on_thumb)
             self._pool.start(loader)
             count += 1
@@ -1244,7 +1381,8 @@ class ThumbnailGrid(QWidget):
                 loader = ThumbnailLoader(entry, cmap, token,
                                          ScanCard.IMG_W, ScanCard.IMG_H,
                                          clip_low, clip_high,
-                                         processing=proc or None)
+                                         processing=proc or None,
+                                         thumbnail_channel=self._thumbnail_channel)
                 loader.signals.loaded.connect(self._on_thumb)
                 self._pool.start(loader)
         return len(self._selected)
@@ -1274,7 +1412,8 @@ class ThumbnailGrid(QWidget):
                 loader = ThumbnailLoader(entry, prev_cmap, token,
                                          ScanCard.IMG_W, ScanCard.IMG_H,
                                          prev_low, prev_high,
-                                         processing=prev_proc or None)
+                                         processing=prev_proc or None,
+                                         thumbnail_channel=self._thumbnail_channel)
                 loader.signals.loaded.connect(self._on_thumb)
                 self._pool.start(loader)
                 count += 1
@@ -1307,7 +1446,8 @@ class ThumbnailGrid(QWidget):
             loader = ThumbnailLoader(entry, prev_cmap, token,
                                      ScanCard.IMG_W, ScanCard.IMG_H,
                                      prev_clip[0], prev_clip[1],
-                                     processing=None)
+                                     processing=None,
+                                     thumbnail_channel=self._thumbnail_channel)
             loader.signals.loaded.connect(self._on_thumb)
             self._pool.start(loader)
             count += 1
@@ -2268,7 +2408,8 @@ class ImageViewerDialog(QDialog):
                  colormap: str, t: dict, parent=None,
                  clip_low: float = 1.0, clip_high: float = 99.0,
                  processing: dict = None,
-                 spec_image_map: Optional[dict] = None):
+                 spec_image_map: Optional[dict] = None,
+                 initial_plane_idx: int = 0):
         super().__init__(parent)
         self.setWindowTitle(entry.stem)
         self.setMinimumSize(960, 680)
@@ -2299,6 +2440,7 @@ class ImageViewerDialog(QDialog):
         self._roi_rect_px: Optional[tuple[int, int, int, int]] = None
         self._zero_pick_mode: str = "offset"
         self._zero_plane_points_px: list[tuple[int, int]] = []
+        self._pending_initial_plane_idx: Optional[int] = max(0, int(initial_plane_idx))
 
         self._build()
         self._processing_panel.set_state(self._processing)
@@ -2748,6 +2890,12 @@ class ImageViewerDialog(QDialog):
         try:
             _scan = load_scan(entry.path)
             self._set_scan_channel_choices(_scan)
+            if self._pending_initial_plane_idx is not None:
+                target = max(0, min(self._pending_initial_plane_idx, _scan.n_planes - 1))
+                self._ch_cb.blockSignals(True)
+                self._ch_cb.setCurrentIndex(target)
+                self._ch_cb.blockSignals(False)
+                self._pending_initial_plane_idx = None
             idx = self._ch_cb.currentIndex()
             self._raw_arr = _scan.planes[idx] if idx < _scan.n_planes else None
             self._scan_header  = _scan.header or {}
@@ -3736,6 +3884,7 @@ class BrowseToolPanel(QWidget):
     reset_requested            = Signal()
     map_spectra_requested      = Signal()
     filter_changed             = Signal(str)   # "all" | "images" | "spectra"
+    thumbnail_channel_changed  = Signal(str)
 
     def __init__(self, t: dict, cfg: dict, parent=None):
         super().__init__(parent)
@@ -3829,6 +3978,24 @@ class BrowseToolPanel(QWidget):
         self._sel_hint.setFont(QFont("Helvetica", 9))
         self._sel_hint.setWordWrap(True)
         lay.addWidget(self._sel_hint)
+        lay.addWidget(_sep())
+
+        # ── Thumbnail channel ─────────────────────────────────────────────────
+        thumb_lbl = QLabel("Thumbnail channel")
+        thumb_lbl.setFont(QFont("Helvetica", 9, QFont.Bold))
+        lay.addWidget(thumb_lbl)
+
+        self.thumbnail_channel_cb = QComboBox()
+        self.thumbnail_channel_cb.addItems(THUMBNAIL_CHANNEL_OPTIONS)
+        self.thumbnail_channel_cb.setCurrentText(THUMBNAIL_CHANNEL_DEFAULT)
+        self.thumbnail_channel_cb.setFont(QFont("Helvetica", 10))
+        self.thumbnail_channel_cb.setToolTip(
+            "Choose which forward scan channel is used for browse thumbnails. "
+            "Files without that channel fall back to Z."
+        )
+        self.thumbnail_channel_cb.currentTextChanged.connect(
+            self.thumbnail_channel_changed.emit)
+        lay.addWidget(self.thumbnail_channel_cb)
         lay.addWidget(_sep())
 
         # ── Display Scale ──────────────────────────────────────────────────────
@@ -5309,6 +5476,7 @@ class ProbeFlowWindow(QMainWindow):
         self._browse_tools.reset_requested.connect(self._on_reset)
         self._browse_tools.map_spectra_requested.connect(self._on_map_spectra)
         self._browse_tools.filter_changed.connect(self._on_filter_changed)
+        self._browse_tools.thumbnail_channel_changed.connect(self._on_thumbnail_channel_changed)
         # Sync initial filter state from the toolbar into the grid so the
         # two agree even before the first folder is opened.
         self._grid.apply_filter(self._browse_tools.get_filter_mode())
@@ -5442,6 +5610,15 @@ class ProbeFlowWindow(QMainWindow):
         else:
             msg = f"{n_sxm} {img_word}, {n_vert} {spec_word}"
         self._status_bar.showMessage(msg)
+
+    def _on_thumbnail_channel_changed(self, channel: str):
+        n = self._grid.set_thumbnail_channel(channel)
+        if n == 0:
+            self._status_bar.showMessage(f"Thumbnail channel: {channel}")
+        else:
+            self._status_bar.showMessage(
+                f"Thumbnail channel: {channel} — queued {n} image thumbnail"
+                f"{'s' if n != 1 else ''}")
 
     def _on_apply_colormap(self, cmap_key: str):
         clip_low, clip_high = self._browse_tools.get_clip_values()
@@ -5908,10 +6085,12 @@ class ProbeFlowWindow(QMainWindow):
                 # of whatever the browse-tool scale sliders are set to.
                 clip = (1.0, 99.0)
             sxm_entries = [e for e in self._grid.get_entries() if isinstance(e, SxmFile)]
+            initial_plane_idx = self._grid.thumbnail_plane_index_for_entry(entry)
             dlg = ImageViewerDialog(entry, sxm_entries, cmap_key, t, self,
                                     clip_low=clip[0], clip_high=clip[1],
                                     processing=proc,
-                                    spec_image_map=self._spec_image_map)
+                                    spec_image_map=self._spec_image_map,
+                                    initial_plane_idx=initial_plane_idx)
             dlg.exec()
 
     # ── Convert ────────────────────────────────────────────────────────────────
