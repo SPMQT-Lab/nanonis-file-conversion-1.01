@@ -226,3 +226,20 @@ Scan owns graph.
 Image/Measurement/Operation nodes live inside the scan graph.
 Plugins declare inputs and outputs.
 ProbeFlow handles graph/provenance/storage.
+
+
+## Response
+
+I think the image history idea is a strong one. Tracking where each image came from, what was done to it, and which measurements or exports came out of it would be useful. That could become one of the main things that makes ProbeFlow different from just another image viewer.
+
+The only thing I’d push back on slightly is the idea that ProbeFlow should mostly avoid doing image processing itself. I agree that we should not try to recreate all of Gwyddion, ImageJ, WSXM, or AngstromPro. But ProbeFlow still needs a solid internal set of STM/AFM image-cleanup tools, otherwise it becomes a bit stranded. If I open ProbeFlow, but then immediately need another program to subtract a plane, adjust the colour scale, do a line profile, or remove bad lines, then ProbeFlow has not really solved the workflow problem.
+
+For us, the core issue is that the existing tools are all limiting in different ways. WSXM is Windows-only and slow to load files. Gwyddion is powerful, but it tries to cover everything and a lot of it is not quite aimed at our workflows. ImageJ has been useful, but the file conversion side has become fragile, and rewriting Java plugins is not something we want to depend on. Newer programs like AngstromPro or AISurf may be very useful, but they need the data in the right state first. AISurf using PNG input is a good example, if the image still has a big background or tilt, the PNG may technically load, but it probably will not be a good input.
+
+So I think ProbeFlow should be the starting point for the workflow: opening, browsing, correcting, checking, and exporting STM/AFM data in a reliable way. That means keeping a proper native processing core. Not every possible algorithm, but the important base operations: row alignment, bad-line correction, plane and polynomial background subtraction, STM-style line background correction, smoothing/denoising, FFT filtering, periodic filtering, ROI-based corrections, line profiles, colour scaling, scale bars, and clean PNG/SXM/GWY/CSV-style exports.
+
+Then the handoff idea becomes much stronger. ProbeFlow would not just send raw data to another package. It would send a well-prepared image, with the calibration, display settings, and processing history attached. If the result comes back from another tool, we should be able to know which source image and which processing state produced it.
+
+So I’d frame the roadmap as: ProbeFlow should be the home base for STM/qPlus data preparation and provenance. It should have enough processing to make the data useful and trustworthy on its own, while still making it easy to hand off to more specialized tools when needed.
+
+The history/graph idea fits well with that, but I would start from the practical workflow rather than building a very abstract system first. Load the raw scan, preserve the metadata, apply a tracked set of core corrections, make measurements or exports, and record enough information that we can understand or reproduce what happened later. That gives us a stable base, and then plugins or external-tool adapters can be added on top.
