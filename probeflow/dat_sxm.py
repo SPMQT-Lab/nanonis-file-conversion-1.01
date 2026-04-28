@@ -1,7 +1,4 @@
-"""Convert Createc .dat image files to .sxm format.
-
-Authors: rnpla, GCampi
-"""
+"""Convert Createc .dat image files to .sxm format."""
 
 import argparse
 import json

@@ -1,5 +1,5 @@
 {
-  "file": "C:\\Users\\rnpla\\Desktop\\stm\\sxm_need\\try_display_sxm_file\\Co_BN_Rh(111)_2013-06-10_08-45-38_img.sxm",
+  "file": "reference_sxm_fixture.sxm",
   "SCAN_PIXELS": "240 240",
   "planes": 4,
   "expected_payload_bytes": 921600,
