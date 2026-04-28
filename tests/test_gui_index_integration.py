@@ -1,4 +1,4 @@
-"""Tests for Phase 3d-4: GUI folder discovery via index_folder().
+"""Tests for GUI folder discovery via index_folder().
 
 These tests cover the pure filtering helpers and the SxmFile/VertFile
 conversion layer.  They do not require Qt or a running GUI.

@@ -1,4 +1,4 @@
-"""Tests for Phase-0e: COMMENT field written to .sxm on export."""
+"""Tests for processing provenance written to the .sxm COMMENT field."""
 
 from __future__ import annotations
 

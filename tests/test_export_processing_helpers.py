@@ -1,4 +1,4 @@
-"""Tests for Phase-0e fix-up: overwrite protection and GUI processing helper."""
+"""Tests for export safety and GUI processing helper behavior."""
 
 from __future__ import annotations
 

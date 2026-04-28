@@ -1,4 +1,4 @@
-"""Tests for Phase-0e processing_history wiring in the CLI layer."""
+"""Tests for processing-history wiring in the CLI layer."""
 
 from __future__ import annotations
 

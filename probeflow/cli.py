@@ -1220,7 +1220,7 @@ def _build_parser() -> argparse.ArgumentParser:
     period.add_argument("--verbose", action="store_true")
     period.set_defaults(func=_cmd_periodicity)
 
-    # ── Phase-3: features / counting / lattice / denoise / classify ──
+    # ── Optional feature commands: counting / lattice / denoise / classify ──
     particles = sub.add_parser("particles",
         help="Segment bright (or dark) particles / molecules on a scan plane")
     particles.add_argument("input", type=Path)
