@@ -22,12 +22,15 @@ from probeflow.indexing import (
 from probeflow.gui import (
     _scan_items_to_sxm,
     _spec_items_to_vert,
+    BrowseInfoPanel,
+    BrowseToolPanel,
     render_scan_thumbnail,
     render_with_processing,
     resolve_thumbnail_plane_index,
     THUMBNAIL_CHANNEL_DEFAULT,
     SxmFile,
     ThumbnailGrid,
+    THEMES,
     VertFile,
 )
 
@@ -212,7 +215,8 @@ class TestThumbnailChannelResolution:
 
 
 class TestThumbnailGridChannelSelection:
-    def test_load_defaults_to_z_channel_for_scan_cards(self, qapp, monkeypatch):
+    @staticmethod
+    def _patch_thumbnail_loader(monkeypatch):
         import probeflow.gui as gui_mod
 
         captured = []
@@ -226,7 +230,12 @@ class TestThumbnailGridChannelSelection:
 
         class FakeThumbnailLoader:
             def __init__(self, entry, colormap, token, w, h, *args, **kwargs):
-                captured.append((entry.stem, kwargs.get("thumbnail_channel")))
+                captured.append({
+                    "stem": entry.stem,
+                    "colormap": colormap,
+                    "thumbnail_channel": kwargs.get("thumbnail_channel"),
+                    "processing": kwargs.get("processing"),
+                })
                 self.signals = _Signals()
 
         class FakePool:
@@ -234,6 +243,12 @@ class TestThumbnailGridChannelSelection:
                 pass
 
         monkeypatch.setattr(gui_mod, "ThumbnailLoader", FakeThumbnailLoader)
+        return captured, FakePool
+
+    def test_load_defaults_to_z_channel_for_scan_cards(self, qapp, monkeypatch):
+        import probeflow.gui as gui_mod
+
+        captured, FakePool = self._patch_thumbnail_loader(monkeypatch)
         grid = ThumbnailGrid(gui_mod.THEMES["dark"])
         grid._pool = FakePool()
         entries = [
@@ -243,7 +258,7 @@ class TestThumbnailGridChannelSelection:
 
         grid.load(entries)
 
-        assert captured == [("a", "Z")]
+        assert [(c["stem"], c["thumbnail_channel"]) for c in captured] == [("a", "Z")]
 
         grid.close()
         grid.deleteLater()
@@ -251,25 +266,7 @@ class TestThumbnailGridChannelSelection:
     def test_changing_thumbnail_channel_rerenders_scan_cards(self, qapp, monkeypatch):
         import probeflow.gui as gui_mod
 
-        captured = []
-
-        class _Signal:
-            def connect(self, _slot):
-                pass
-
-        class _Signals:
-            loaded = _Signal()
-
-        class FakeThumbnailLoader:
-            def __init__(self, entry, colormap, token, w, h, *args, **kwargs):
-                captured.append((entry.stem, kwargs.get("thumbnail_channel")))
-                self.signals = _Signals()
-
-        class FakePool:
-            def start(self, _loader):
-                pass
-
-        monkeypatch.setattr(gui_mod, "ThumbnailLoader", FakeThumbnailLoader)
+        captured, FakePool = self._patch_thumbnail_loader(monkeypatch)
         grid = ThumbnailGrid(gui_mod.THEMES["dark"])
         grid._pool = FakePool()
         entries = [
@@ -283,13 +280,120 @@ class TestThumbnailGridChannelSelection:
         n = grid.set_thumbnail_channel("Frequency shift")
 
         assert n == 2
-        assert captured == [
+        assert [(c["stem"], c["thumbnail_channel"]) for c in captured] == [
             ("a", "Frequency shift"),
             ("b", "Frequency shift"),
         ]
 
         grid.close()
         grid.deleteLater()
+
+    def test_changing_thumbnail_colormap_rerenders_all_scan_cards(self, qapp, monkeypatch):
+        import probeflow.gui as gui_mod
+
+        captured, FakePool = self._patch_thumbnail_loader(monkeypatch)
+        grid = ThumbnailGrid(gui_mod.THEMES["dark"])
+        grid._pool = FakePool()
+        entries = [
+            SxmFile(path=Path("a.sxm"), stem="a"),
+            SxmFile(path=Path("b.sxm"), stem="b"),
+            VertFile(path=Path("spec.VERT"), stem="spec"),
+        ]
+        grid.load(entries)
+        captured.clear()
+
+        n = grid.set_thumbnail_colormap("plasma")
+
+        assert n == 2
+        assert [(c["stem"], c["colormap"]) for c in captured] == [
+            ("a", "plasma"),
+            ("b", "plasma"),
+        ]
+
+        grid.close()
+        grid.deleteLater()
+
+    def test_changing_thumbnail_align_rows_rerenders_preview_only(self, qapp, monkeypatch):
+        import probeflow.gui as gui_mod
+
+        captured, FakePool = self._patch_thumbnail_loader(monkeypatch)
+        grid = ThumbnailGrid(gui_mod.THEMES["dark"])
+        grid._pool = FakePool()
+        entries = [SxmFile(path=Path("a.sxm"), stem="a")]
+        grid.load(entries)
+        captured.clear()
+
+        n = grid.set_thumbnail_align_rows("Median")
+
+        assert n == 1
+        assert captured[0]["processing"] == {"align_rows": "median"}
+        assert grid.get_card_state("a")[2] == {}
+
+        captured.clear()
+        grid.set_thumbnail_align_rows("None")
+        assert captured[0]["processing"] is None
+
+        grid.close()
+        grid.deleteLater()
+
+
+class TestBrowseLayoutCleanup:
+    def test_browse_tool_panel_has_live_thumbnail_controls_only(self, qapp):
+        from PySide6.QtWidgets import QPushButton
+
+        panel = BrowseToolPanel(THEMES["dark"], {})
+        button_texts = {btn.text() for btn in panel.findChildren(QPushButton)}
+
+        assert panel.align_rows_cb.currentText() == "None"
+        assert "Map spectra to images…" in button_texts
+        assert "Apply to selection" not in button_texts
+        assert "Auto clip (GMM)" not in button_texts
+        assert "Apply to selected thumbnails" not in button_texts
+        assert "Apply to all thumbnails" not in button_texts
+        assert "↩ Undo last thumbnail change" not in button_texts
+        assert "⟲ Reset to original (clear all filters)" not in button_texts
+        assert "⬇ Export PNG…" not in button_texts
+
+        panel.close()
+        panel.deleteLater()
+
+    def test_browse_info_panel_keeps_key_values_and_channel_slots(self, qapp, monkeypatch):
+        import probeflow.gui as gui_mod
+
+        class FakePool:
+            def start(self, _loader):
+                pass
+
+        panel = BrowseInfoPanel(THEMES["dark"], {})
+        panel._pool = FakePool()
+        entry = SxmFile(
+            path=TESTDATA / "sxm_moire_10nm.sxm",
+            stem="sxm_moire_10nm",
+            Nx=160,
+            Ny=160,
+            scan_nm=10.0,
+            bias_mv=100.0,
+            current_pa=50.0,
+        )
+        monkeypatch.setattr(gui_mod, "load_scan", lambda _path: type(
+            "ScanLike",
+            (),
+            {"plane_names": ["Z forward", "Current forward"], "n_planes": 2, "header": {}},
+        )())
+
+        panel.show_entry(entry, "gray", {})
+
+        assert panel._qi["pixels"].text() == "160 × 160"
+        assert panel._qi["size"].text() == "10.0 nm"
+        assert panel._qi["bias"].text() == "100 mV"
+        assert panel._qi["setp"].text() == "50.0 pA"
+        assert [lbl.text() for lbl in panel._ch_name_lbls] == [
+            "Z forward",
+            "Current forward",
+        ]
+
+        panel.close()
+        panel.deleteLater()
 
 
 class TestSpecViewerRawData:

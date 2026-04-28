@@ -27,8 +27,8 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
     QDialog, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
-    QRadioButton, QScrollArea, QSlider, QSplitter, QStackedWidget,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu, QPushButton,
+    QScrollArea, QSlider, QSplitter, QStackedWidget,
     QStatusBar, QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit,
     QToolTip, QVBoxLayout, QWidget,
 )
@@ -61,7 +61,6 @@ def _open_url(url: str) -> None:
         pass
 
 from probeflow import processing as _proc
-from probeflow.common import mark_processed_stem
 from probeflow.display import (
     array_to_uint8 as _array_to_uint8,
     clip_range_from_array as _clip_range_from_array,
@@ -70,8 +69,6 @@ from probeflow.display import (
 from probeflow.display_state import DisplayRangeState
 from probeflow.export_provenance import build_scan_export_provenance, png_display_state
 from probeflow.gui_processing import (
-    apply_processing_state_to_scan,
-    gui_state_has_numeric_processing,
     processing_state_from_gui,
 )
 from probeflow.gui_features import (
@@ -1122,11 +1119,9 @@ class ThumbnailGrid(QWidget):
     """
     Browse panel: folder toolbar + thumbnail grid.
 
-    - All images default to grayscale on load.
+    - All images share a global thumbnail appearance.
     - Click = single-select; Ctrl+click = multi-select toggle.
     - Double-click = open full-size image viewer.
-    - set_colormap_for_selection() reloads ONLY selected cards with the new colormap.
-    - Unselected cards keep their current colormap (gray by default).
     """
     entry_selected    = Signal(object)   # primary SxmFile for sidebar
     selection_changed = Signal(int)      # count of selected items
@@ -1177,12 +1172,10 @@ class ThumbnailGrid(QWidget):
         self._entries:        list[Union[SxmFile, VertFile]]       = []
         self._selected:       set[str]                         = set()
         self._primary:        Optional[str]                    = None
-        self._card_colormaps: dict[str, str]                   = {}
-        self._card_processing: dict[str, dict]                 = {}   # current processing per stem
-        self._card_clip:      dict[str, tuple[float, float]]   = {}   # current clip per stem
+        self._thumbnail_colormap: str                          = DEFAULT_CMAP_KEY
+        self._thumbnail_processing: dict                       = {}
+        self._thumbnail_clip: tuple[float, float]              = (1.0, 99.0)
         self._thumbnail_channel: str                           = THUMBNAIL_CHANNEL_DEFAULT
-        # per-stem undo stack: list of (colormap, clip_low, clip_high, processing)
-        self._history:        dict[str, list[tuple]]           = {}
         self._load_token                                       = object()
         self._current_cols: int                                = 1
         self._filter_mode: str                                 = "all"
@@ -1198,10 +1191,6 @@ class ThumbnailGrid(QWidget):
         self._entries         = entries
         self._selected        = set()
         self._primary         = None
-        self._card_colormaps  = {}
-        self._card_processing = {}
-        self._card_clip       = {}
-        self._history         = {}
         self._load_token      = object()
 
         if folder_path:
@@ -1237,7 +1226,6 @@ class ThumbnailGrid(QWidget):
                 card = SpecCard(entry, self._t)
             else:
                 card = ScanCard(entry, self._t)
-                self._card_colormaps[entry.stem] = DEFAULT_CMAP_KEY
                 card.context_action_requested.connect(self.card_context_action)
             card.clicked.connect(self._on_card_click)
             card.double_clicked.connect(self._on_card_dbl)
@@ -1254,76 +1242,59 @@ class ThumbnailGrid(QWidget):
                 loader = SpecThumbnailLoader(entry, token,
                                              SpecCard.IMG_W, SpecCard.IMG_H)
             else:
-                loader = ThumbnailLoader(entry, DEFAULT_CMAP_KEY, token,
-                                         ScanCard.IMG_W, ScanCard.IMG_H,
-                                         thumbnail_channel=self._thumbnail_channel)
+                loader = self._make_thumbnail_loader(entry, token)
             loader.signals.loaded.connect(self._on_thumb)
             self._pool.start(loader)
 
-    HISTORY_MAX = 30
+    def _make_thumbnail_loader(self, entry: SxmFile, token) -> ThumbnailLoader:
+        clip_low, clip_high = self._thumbnail_clip
+        return ThumbnailLoader(entry, self._thumbnail_colormap, token,
+                               ScanCard.IMG_W, ScanCard.IMG_H,
+                               clip_low, clip_high,
+                               processing=self._thumbnail_processing or None,
+                               thumbnail_channel=self._thumbnail_channel)
 
-    def set_colormap_for_selection(self, colormap_key: str,
-                                    clip_low: float = 1.0,
-                                    clip_high: float = 99.0,
-                                    processing: dict = None,
-                                    push_history: bool = True) -> int:
-        """Apply colormap, scale and optional processing to selected cards. Returns count updated."""
-        if not self._selected:
-            return 0
+    def _rerender_scan_thumbnails(self) -> int:
         token = self._load_token
-        for stem in self._selected:
-            entry = next((e for e in self._entries if e.stem == stem), None)
-            card  = self._cards.get(stem)
-            if entry and card and isinstance(entry, SxmFile):
-                if push_history:
-                    prev_cmap = self._card_colormaps.get(stem, DEFAULT_CMAP_KEY)
-                    prev_clip = self._card_clip.get(stem, (1.0, 99.0))
-                    prev_proc = self._card_processing.get(stem, {})
-                    stack = self._history.setdefault(stem, [])
-                    stack.append((prev_cmap, prev_clip[0], prev_clip[1],
-                                   dict(prev_proc)))
-                    if len(stack) > self.HISTORY_MAX:
-                        del stack[0:len(stack) - self.HISTORY_MAX]
-                # apply new state
-                self._card_colormaps[stem]  = colormap_key
-                self._card_clip[stem]       = (clip_low, clip_high)
-                self._card_processing[stem] = dict(processing) if processing else {}
-                loader = ThumbnailLoader(entry, colormap_key, token,
-                                         ScanCard.IMG_W, ScanCard.IMG_H,
-                                         clip_low, clip_high,
-                                         processing=processing,
-                                         thumbnail_channel=self._thumbnail_channel)
-                loader.signals.loaded.connect(self._on_thumb)
-                self._pool.start(loader)
-        return len(self._selected)
+        count = 0
+        for entry in self._entries:
+            if not isinstance(entry, SxmFile) or entry.stem not in self._cards:
+                continue
+            loader = self._make_thumbnail_loader(entry, token)
+            loader.signals.loaded.connect(self._on_thumb)
+            self._pool.start(loader)
+            count += 1
+        return count
+
+    def set_thumbnail_colormap(self, colormap_key: str) -> int:
+        """Set the global browse thumbnail colormap and re-render scan cards."""
+        self._thumbnail_colormap = colormap_key or DEFAULT_CMAP_KEY
+        return self._rerender_scan_thumbnails()
 
     def set_thumbnail_channel(self, channel: str) -> int:
         """Set the global browse thumbnail channel and re-render scan cards."""
         if channel not in THUMBNAIL_CHANNEL_OPTIONS:
             channel = THUMBNAIL_CHANNEL_DEFAULT
         self._thumbnail_channel = channel
-        token = self._load_token
-        count = 0
-        for entry in self._entries:
-            if not isinstance(entry, SxmFile):
-                continue
-            if entry.stem not in self._cards:
-                continue
-            cmap = self._card_colormaps.get(entry.stem, DEFAULT_CMAP_KEY)
-            clip = self._card_clip.get(entry.stem, (1.0, 99.0))
-            proc = self._card_processing.get(entry.stem, {})
-            loader = ThumbnailLoader(entry, cmap, token,
-                                     ScanCard.IMG_W, ScanCard.IMG_H,
-                                     clip[0], clip[1],
-                                     processing=proc or None,
-                                     thumbnail_channel=self._thumbnail_channel)
-            loader.signals.loaded.connect(self._on_thumb)
-            self._pool.start(loader)
-            count += 1
-        return count
+        return self._rerender_scan_thumbnails()
+
+    def set_thumbnail_align_rows(self, mode: str | None) -> int:
+        """Set the global browse thumbnail row-alignment preview mode."""
+        value = (mode or "").strip().lower()
+        if value in ("median", "mean"):
+            self._thumbnail_processing = {"align_rows": value}
+        else:
+            self._thumbnail_processing = {}
+        return self._rerender_scan_thumbnails()
 
     def thumbnail_channel(self) -> str:
         return self._thumbnail_channel
+
+    def thumbnail_colormap(self) -> str:
+        return self._thumbnail_colormap
+
+    def thumbnail_processing(self) -> dict:
+        return dict(self._thumbnail_processing)
 
     def thumbnail_plane_index_for_entry(self, entry: SxmFile) -> int:
         try:
@@ -1332,126 +1303,13 @@ class ThumbnailGrid(QWidget):
         except Exception:
             return 0
 
-    def set_processing_for_all_images(self, processing: dict,
-                                      push_history: bool = True) -> int:
-        """Apply thumbnail processing to every scan, preserving colour/clip."""
-        token = self._load_token
-        count = 0
-        for entry in self._entries:
-            if not isinstance(entry, SxmFile):
-                continue
-            card = self._cards.get(entry.stem)
-            if not card:
-                continue
-            stem = entry.stem
-            prev_cmap = self._card_colormaps.get(stem, DEFAULT_CMAP_KEY)
-            prev_clip = self._card_clip.get(stem, (1.0, 99.0))
-            prev_proc = self._card_processing.get(stem, {})
-            if push_history:
-                stack = self._history.setdefault(stem, [])
-                stack.append((prev_cmap, prev_clip[0], prev_clip[1],
-                              dict(prev_proc)))
-                if len(stack) > self.HISTORY_MAX:
-                    del stack[0:len(stack) - self.HISTORY_MAX]
-
-            self._card_processing[stem] = dict(processing) if processing else {}
-            loader = ThumbnailLoader(entry, prev_cmap, token,
-                                     ScanCard.IMG_W, ScanCard.IMG_H,
-                                     prev_clip[0], prev_clip[1],
-                                     processing=processing or None,
-                                     thumbnail_channel=self._thumbnail_channel)
-            loader.signals.loaded.connect(self._on_thumb)
-            self._pool.start(loader)
-            count += 1
-        return count
-
-    def update_clip_for_selection(self, clip_low: float, clip_high: float) -> int:
-        """Re-render selected cards with new clip, preserving their colormap and
-        processing. Does NOT push to undo history (used by live scale slider)."""
-        if not self._selected:
-            return 0
-        token = self._load_token
-        for stem in self._selected:
-            entry = next((e for e in self._entries if e.stem == stem), None)
-            card  = self._cards.get(stem)
-            if entry and card and isinstance(entry, SxmFile):
-                cmap = self._card_colormaps.get(stem, DEFAULT_CMAP_KEY)
-                proc = self._card_processing.get(stem, {})
-                self._card_clip[stem] = (clip_low, clip_high)
-                loader = ThumbnailLoader(entry, cmap, token,
-                                         ScanCard.IMG_W, ScanCard.IMG_H,
-                                         clip_low, clip_high,
-                                         processing=proc or None,
-                                         thumbnail_channel=self._thumbnail_channel)
-                loader.signals.loaded.connect(self._on_thumb)
-                self._pool.start(loader)
-        return len(self._selected)
-
     def get_card_state(self, stem: str) -> tuple[str, tuple[float, float], dict]:
-        """Return (colormap_key, (clip_low, clip_high), processing_dict) for a stem."""
-        cmap = self._card_colormaps.get(stem, DEFAULT_CMAP_KEY)
-        clip = self._card_clip.get(stem, (1.0, 99.0))
-        proc = self._card_processing.get(stem, {})
-        return cmap, clip, dict(proc)
+        """Return viewer-opening state for a stem.
 
-    def undo_last(self, stems: set[str]) -> int:
-        """Revert the last applied colormap/clip/processing for the given stems."""
-        count = 0
-        token = self._load_token
-        for stem in stems:
-            stack = self._history.get(stem)
-            if not stack:
-                continue
-            prev_cmap, prev_low, prev_high, prev_proc = stack.pop()
-            entry = next((e for e in self._entries if e.stem == stem), None)
-            card  = self._cards.get(stem)
-            if entry and card and isinstance(entry, SxmFile):
-                self._card_colormaps[stem]  = prev_cmap
-                self._card_clip[stem]       = (prev_low, prev_high)
-                self._card_processing[stem] = prev_proc
-                loader = ThumbnailLoader(entry, prev_cmap, token,
-                                         ScanCard.IMG_W, ScanCard.IMG_H,
-                                         prev_low, prev_high,
-                                         processing=prev_proc or None,
-                                         thumbnail_channel=self._thumbnail_channel)
-                loader.signals.loaded.connect(self._on_thumb)
-                self._pool.start(loader)
-                count += 1
-        return count
-
-    def reset_to_original(self, stems: set[str]) -> int:
-        """Drop ALL processing for the given stems and reload the raw thumbnail.
-
-        Pushes the prior state to the undo stack so the reset itself is
-        reversible. Colormap and clip percentiles are preserved; only the
-        numerical processing pipeline is cleared.
+        Browse align-row correction is only a thumbnail preview aid, so the
+        full viewer opens raw unless the user applies processing there.
         """
-        count = 0
-        token = self._load_token
-        for stem in stems:
-            entry = next((e for e in self._entries if e.stem == stem), None)
-            card  = self._cards.get(stem)
-            if not (entry and card and isinstance(entry, SxmFile)):
-                continue
-            prev_cmap = self._card_colormaps.get(stem, DEFAULT_CMAP_KEY)
-            prev_clip = self._card_clip.get(stem, (1.0, 99.0))
-            prev_proc = self._card_processing.get(stem, {})
-            if not prev_proc:
-                continue  # already raw — nothing to reset
-            stack = self._history.setdefault(stem, [])
-            stack.append((prev_cmap, prev_clip[0], prev_clip[1], dict(prev_proc)))
-            if len(stack) > self.HISTORY_MAX:
-                del stack[0:len(stack) - self.HISTORY_MAX]
-            self._card_processing[stem] = {}
-            loader = ThumbnailLoader(entry, prev_cmap, token,
-                                     ScanCard.IMG_W, ScanCard.IMG_H,
-                                     prev_clip[0], prev_clip[1],
-                                     processing=None,
-                                     thumbnail_channel=self._thumbnail_channel)
-            loader.signals.loaded.connect(self._on_thumb)
-            self._pool.start(loader)
-            count += 1
-        return count
+        return self._thumbnail_colormap, self._thumbnail_clip, {}
 
     def get_entries(self) -> list[Union[SxmFile, VertFile]]:
         return self._entries
@@ -3872,16 +3730,10 @@ class ViewerSpecMappingDialog(QDialog):
 
 # ── Browse tool panel (LEFT) ──────────────────────────────────────────────────
 class BrowseToolPanel(QWidget):
-    """Left-side control panel: folder, colormap, scale, processing, export."""
+    """Left-side control panel for browsing and live thumbnail appearance."""
     open_folder_requested      = Signal()
-    colormap_apply_requested   = Signal(str)
-    scale_changed              = Signal(float, float)
-    processing_apply_requested = Signal(dict)
-    processing_apply_all_requested = Signal(dict)
-    autoclip_requested         = Signal()
-    export_requested           = Signal()
-    undo_requested             = Signal()
-    reset_requested            = Signal()
+    colormap_changed           = Signal(str)
+    thumbnail_align_changed    = Signal(str)
     map_spectra_requested      = Signal()
     filter_changed             = Signal(str)   # "all" | "images" | "spectra"
     thumbnail_channel_changed  = Signal(str)
@@ -3889,8 +3741,6 @@ class BrowseToolPanel(QWidget):
     def __init__(self, t: dict, cfg: dict, parent=None):
         super().__init__(parent)
         self._t            = t
-        self._clip_low     = cfg.get("clip_low",  1.0)
-        self._clip_high    = cfg.get("clip_high", 99.0)
         self._filter_mode  = cfg.get("browse_filter", "all")
         self._build(cfg)
 
@@ -3955,32 +3805,22 @@ class BrowseToolPanel(QWidget):
         lay.addWidget(filter_row)
         lay.addWidget(_sep())
 
-        # ── Colormap ───────────────────────────────────────────────────────────
+        # ── Thumbnail appearance ──────────────────────────────────────────────
+        appearance_lbl = QLabel("Thumbnail appearance")
+        appearance_lbl.setFont(QFont("Helvetica", 11, QFont.Bold))
+        lay.addWidget(appearance_lbl)
+
         cm_lbl = QLabel("Colormap")
-        cm_lbl.setFont(QFont("Helvetica", 11, QFont.Bold))
+        cm_lbl.setFont(QFont("Helvetica", 9, QFont.Bold))
         lay.addWidget(cm_lbl)
 
         self.cmap_cb = QComboBox()
         self.cmap_cb.addItems(CMAP_NAMES)
         self.cmap_cb.setCurrentText(cfg.get("colormap", DEFAULT_CMAP_LABEL))
         self.cmap_cb.setFont(QFont("Helvetica", 10))
+        self.cmap_cb.currentTextChanged.connect(self._on_colormap_changed)
         lay.addWidget(self.cmap_cb)
 
-        self._apply_btn = QPushButton("Apply to selection")
-        self._apply_btn.setFont(QFont("Helvetica", 10))
-        self._apply_btn.setFixedHeight(30)
-        self._apply_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self._apply_btn.setObjectName("accentBtn")
-        self._apply_btn.clicked.connect(self._on_apply)
-        lay.addWidget(self._apply_btn)
-
-        self._sel_hint = QLabel("Select images first (Ctrl+click for multi-select)")
-        self._sel_hint.setFont(QFont("Helvetica", 9))
-        self._sel_hint.setWordWrap(True)
-        lay.addWidget(self._sel_hint)
-        lay.addWidget(_sep())
-
-        # ── Thumbnail channel ─────────────────────────────────────────────────
         thumb_lbl = QLabel("Thumbnail channel")
         thumb_lbl.setFont(QFont("Helvetica", 9, QFont.Bold))
         lay.addWidget(thumb_lbl)
@@ -3996,102 +3836,21 @@ class BrowseToolPanel(QWidget):
         self.thumbnail_channel_cb.currentTextChanged.connect(
             self.thumbnail_channel_changed.emit)
         lay.addWidget(self.thumbnail_channel_cb)
+
+        align_lbl = QLabel("Align rows")
+        align_lbl.setFont(QFont("Helvetica", 9, QFont.Bold))
+        lay.addWidget(align_lbl)
+        self.align_rows_cb = QComboBox()
+        self.align_rows_cb.addItems(["None", "Median", "Mean"])
+        self.align_rows_cb.setCurrentText("None")
+        self.align_rows_cb.setFont(QFont("Helvetica", 10))
+        self.align_rows_cb.setToolTip(
+            "Preview-only thumbnail row alignment. Full-size viewer data opens raw."
+        )
+        self.align_rows_cb.currentTextChanged.connect(self._on_align_changed)
+        lay.addWidget(self.align_rows_cb)
         lay.addWidget(_sep())
 
-        # ── Display Scale ──────────────────────────────────────────────────────
-        scale_hdr = QLabel("Display Scale")
-        scale_hdr.setFont(QFont("Helvetica", 9, QFont.Bold))
-        lay.addWidget(scale_hdr)
-
-        def _slider_row(label: str, init_val: float, mn: int, mx: int, callback):
-            row = QHBoxLayout()
-            lbl = QLabel(label)
-            lbl.setFont(QFont("Helvetica", 8))
-            lbl.setFixedWidth(36)
-            sl = QSlider(Qt.Horizontal)
-            sl.setRange(mn, mx)
-            sl.setValue(int(init_val))
-            val_lbl = QLabel(f"{init_val:.0f}%")
-            val_lbl.setFont(QFont("Helvetica", 8))
-            val_lbl.setFixedWidth(36)
-            def _upd(v, vl=val_lbl, cb=callback):
-                vl.setText(f"{v}%")
-                cb(v)
-            sl.valueChanged.connect(_upd)
-            row.addWidget(lbl)
-            row.addWidget(sl, 1)
-            row.addWidget(val_lbl)
-            lay.addLayout(row)
-            return sl
-
-        self._low_slider  = _slider_row("Low:", cfg.get("clip_low",  1.0),  0,  20, self._on_low_changed)
-        self._high_slider = _slider_row("High:", cfg.get("clip_high", 99.0), 80, 100, self._on_high_changed)
-        lay.addWidget(_sep())
-
-        # ── Quick corrections (collapsible) ───────────────────────────────────
-        self._proc_toggle = QPushButton("[+] Quick corrections")
-        self._proc_toggle.setFlat(True)
-        self._proc_toggle.setFont(QFont("Helvetica", 9, QFont.Bold))
-        self._proc_toggle.setCursor(QCursor(Qt.PointingHandCursor))
-        self._proc_toggle.clicked.connect(self._toggle_proc)
-        lay.addWidget(self._proc_toggle)
-
-        self._proc_widget = QWidget()
-        proc_lay = QVBoxLayout(self._proc_widget)
-        proc_lay.setContentsMargins(4, 2, 0, 2)
-        proc_lay.setSpacing(4)
-
-        self._processing_panel = ProcessingControlPanel("browse_quick")
-        proc_lay.addWidget(self._processing_panel)
-
-        # ── Apply + Auto-clip ──────────────────────────────────────────────────
-        proc_lay.addWidget(_sep())
-
-        self._autoclip_btn = QPushButton("Auto clip (GMM)")
-        self._autoclip_btn.setFont(QFont("Helvetica", 8))
-        self._autoclip_btn.setFixedHeight(26)
-        self._autoclip_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self._autoclip_btn.clicked.connect(self.autoclip_requested.emit)
-        proc_lay.addWidget(self._autoclip_btn)
-
-        self._proc_apply_btn = QPushButton("Apply to selected thumbnails")
-        self._proc_apply_btn.setFont(QFont("Helvetica", 8))
-        self._proc_apply_btn.setFixedHeight(26)
-        self._proc_apply_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self._proc_apply_btn.setObjectName("accentBtn")
-        self._proc_apply_btn.clicked.connect(self._on_proc_apply)
-        proc_lay.addWidget(self._proc_apply_btn)
-
-        self._proc_apply_all_btn = QPushButton("Apply to all thumbnails")
-        self._proc_apply_all_btn.setFont(QFont("Helvetica", 8))
-        self._proc_apply_all_btn.setFixedHeight(26)
-        self._proc_apply_all_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self._proc_apply_all_btn.clicked.connect(self._on_proc_apply_all)
-        proc_lay.addWidget(self._proc_apply_all_btn)
-
-        self._undo_btn = QPushButton("↩ Undo last thumbnail change")
-        self._undo_btn.setFont(QFont("Helvetica", 8))
-        self._undo_btn.setFixedHeight(26)
-        self._undo_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self._undo_btn.clicked.connect(self.undo_requested.emit)
-        proc_lay.addWidget(self._undo_btn)
-
-        self._reset_btn = QPushButton("⟲ Reset to original (clear all filters)")
-        self._reset_btn.setFont(QFont("Helvetica", 8))
-        self._reset_btn.setFixedHeight(26)
-        self._reset_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self._reset_btn.setToolTip(
-            "Discard all processing (background, FFT, smoothing, set-zero, …) "
-            "for the selected images and reload the raw on-disk data. "
-            "Colormap and clip range are preserved. Reversible via Undo.")
-        self._reset_btn.clicked.connect(self.reset_requested.emit)
-        proc_lay.addWidget(self._reset_btn)
-
-        lay.addWidget(self._proc_widget)
-        self._proc_widget.setVisible(False)
-        lay.addWidget(_sep())
-
-        # ── Export ─────────────────────────────────────────────────────────────
         self._map_spectra_btn = QPushButton("Map spectra to images\u2026")
         self._map_spectra_btn.setFont(QFont("Helvetica", 9))
         self._map_spectra_btn.setFixedHeight(28)
@@ -4103,42 +3862,17 @@ class BrowseToolPanel(QWidget):
         self._map_spectra_btn.clicked.connect(self.map_spectra_requested.emit)
         lay.addWidget(self._map_spectra_btn)
 
-        self._export_btn = QPushButton("\u2b07 Export PNG\u2026")
-        self._export_btn.setFont(QFont("Helvetica", 9, QFont.Bold))
-        self._export_btn.setFixedHeight(30)
-        self._export_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self._export_btn.setObjectName("accentBtn")
-        self._export_btn.clicked.connect(self.export_requested.emit)
-        lay.addWidget(self._export_btn)
-
         lay.addStretch()
         scroll.setWidget(inner)
         outer.addWidget(scroll)
 
     # ── Slots ──────────────────────────────────────────────────────────────────
-    def _on_low_changed(self, v: int):
-        self._clip_low = float(v)
-        self.scale_changed.emit(self._clip_low, self._clip_high)
-
-    def _on_high_changed(self, v: int):
-        self._clip_high = float(v)
-        self.scale_changed.emit(self._clip_low, self._clip_high)
-
-    def _on_apply(self):
+    def _on_colormap_changed(self):
         cmap_key = CMAP_KEY.get(self.cmap_cb.currentText(), DEFAULT_CMAP_KEY)
-        self.colormap_apply_requested.emit(cmap_key)
+        self.colormap_changed.emit(cmap_key)
 
-    def _toggle_proc(self):
-        vis = not self._proc_widget.isVisible()
-        self._proc_widget.setVisible(vis)
-        self._proc_toggle.setText(
-            "[-] Quick corrections" if vis else "[+] Quick corrections")
-
-    def _on_proc_apply(self):
-        self.processing_apply_requested.emit(self._processing_panel.state())
-
-    def _on_proc_apply_all(self):
-        self.processing_apply_all_requested.emit(self._processing_panel.state())
+    def _on_align_changed(self, text: str):
+        self.thumbnail_align_changed.emit(text)
 
     def _on_filter_click(self, mode: str):
         self._filter_mode = mode
@@ -4156,16 +3890,13 @@ class BrowseToolPanel(QWidget):
         if not btn.isChecked():
             btn.setChecked(True)
 
-    def get_clip_values(self) -> tuple[float, float]:
-        return self._clip_low, self._clip_high
-
     def update_selection_hint(self, n: int):
         if n == 0:
-            self._sel_hint.setText("Select images first (Ctrl+click for multi-select)")
+            return
         elif n == 1:
-            self._sel_hint.setText("1 image selected")
+            return
         else:
-            self._sel_hint.setText(f"{n} images selected")
+            return
 
     def apply_theme(self, t: dict):
         self._t = t
@@ -4181,24 +3912,25 @@ class BrowseInfoPanel(QWidget):
         self._pool      = QThreadPool.globalInstance()
         self._ch_token  = object()
         self._meta_rows: list[tuple[str, str]] = []
-        self._clip_low  = cfg.get("clip_low",  1.0)
-        self._clip_high = cfg.get("clip_high", 99.0)
+        self._clip_low  = 1.0
+        self._clip_high = 99.0
         self._build()
 
     def _build(self):
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 10, 10, 6)
-        lay.setSpacing(4)
+        lay.setContentsMargins(10, 8, 10, 6)
+        lay.setSpacing(5)
 
         self.name_lbl = QLabel("No scan selected")
-        self.name_lbl.setFont(QFont("Helvetica", 9, QFont.Bold))
+        self.name_lbl.setFont(QFont("Helvetica", 10, QFont.Bold))
         self.name_lbl.setWordWrap(True)
         lay.addWidget(self.name_lbl)
 
-        # Quick-info grid (pixels, size, bias, setpoint). Filled by show_entry().
+        # Compact key scan summary. Keep this tight so channels sit high.
         qi_grid = QGridLayout()
-        qi_grid.setSpacing(4)
-        qi_grid.setContentsMargins(0, 2, 0, 2)
+        qi_grid.setHorizontalSpacing(8)
+        qi_grid.setVerticalSpacing(2)
+        qi_grid.setContentsMargins(0, 0, 0, 0)
         self._qi: dict[str, QLabel] = {}
         _QI_ROWS = [("Pixels", "pixels"), ("Size", "size"),
                     ("Bias",   "bias"),   ("Setp.", "setp")]
@@ -4207,7 +3939,7 @@ class BrowseInfoPanel(QWidget):
             t_lbl = QLabel(title + ":")
             t_lbl.setFont(QFont("Helvetica", 8))
             v_lbl = QLabel("—")
-            v_lbl.setFont(QFont("Helvetica", 8, QFont.Bold))
+            v_lbl.setFont(QFont("Helvetica", 10, QFont.Bold))
             qi_grid.addWidget(t_lbl, r, c * 2)
             qi_grid.addWidget(v_lbl, r, c * 2 + 1)
             self._qi[key] = v_lbl
@@ -4326,10 +4058,6 @@ class BrowseInfoPanel(QWidget):
             lbl.clear()
         self._meta_rows = []
         self.meta_table.setRowCount(0)
-
-    def update_clip(self, clip_low: float, clip_high: float):
-        self._clip_low  = clip_low
-        self._clip_high = clip_high
 
     def apply_theme(self, t: dict):
         self._t = t
@@ -4874,146 +4602,6 @@ class SpecViewerDialog(QDialog):
         return table
 
 
-# ── Export dialog ────────────────────────────────────────────────────────────
-_EXPORT_FORMATS: list[tuple[str, str, str]] = [
-    # (label, suffix without dot, QFileDialog filter string)
-    ("PNG image",    "png", "PNG images (*.png)"),
-    ("PDF figure",   "pdf", "PDF figures (*.pdf)"),
-    ("CSV grid",     "csv", "CSV grids (*.csv)"),
-    ("Nanonis .sxm", "sxm", "Nanonis files (*.sxm)"),
-]
-
-
-class ExportDialog(QDialog):
-    """Pick an output format and per-format options before saving."""
-
-    def __init__(self, t: dict, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Export scan")
-        self.setFixedSize(380, 360)
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(18, 14, 18, 14)
-        lay.setSpacing(8)
-
-        # ── Format picker ───────────────────────────────────────────────────
-        fmt_row = QHBoxLayout()
-        fmt_lbl = QLabel("Format:")
-        fmt_lbl.setFixedWidth(70)
-        self._fmt_cb = QComboBox()
-        for label, _suffix, _filt in _EXPORT_FORMATS:
-            self._fmt_cb.addItem(label)
-        self._fmt_cb.currentIndexChanged.connect(self._update_visible_options)
-        fmt_row.addWidget(fmt_lbl)
-        fmt_row.addWidget(self._fmt_cb, 1)
-        lay.addLayout(fmt_row)
-        lay.addWidget(_sep())
-
-        # ── PNG / PDF options: scale bar toggle + unit + position ───────────
-        self._sb_group = QWidget()
-        sb_outer = QVBoxLayout(self._sb_group)
-        sb_outer.setContentsMargins(0, 0, 0, 0)
-        sb_outer.setSpacing(4)
-
-        self._scalebar_cb = QCheckBox("Add scale bar")
-        self._scalebar_cb.setChecked(True)
-        self._scalebar_cb.toggled.connect(self._on_scalebar_toggled)
-        sb_outer.addWidget(self._scalebar_cb)
-
-        self._sb_opts = QWidget()
-        sb_lay = QVBoxLayout(self._sb_opts)
-        sb_lay.setContentsMargins(12, 0, 0, 0)
-        sb_lay.setSpacing(4)
-
-        unit_row = QHBoxLayout()
-        unit_lbl = QLabel("Unit:")
-        unit_lbl.setFixedWidth(60)
-        self._unit_group = QButtonGroup(self)
-        self._nm_rb  = QRadioButton("nm")
-        self._ang_rb = QRadioButton("Å")
-        self._pm_rb  = QRadioButton("pm")
-        self._nm_rb.setChecked(True)
-        for rb in (self._nm_rb, self._ang_rb, self._pm_rb):
-            self._unit_group.addButton(rb)
-            unit_row.addWidget(rb)
-        unit_row.insertWidget(0, unit_lbl)
-        unit_row.addStretch()
-        sb_lay.addLayout(unit_row)
-
-        pos_row = QHBoxLayout()
-        pos_lbl = QLabel("Position:")
-        pos_lbl.setFixedWidth(60)
-        self._pos_cb = QComboBox()
-        self._pos_cb.addItems(["bottom-right", "bottom-left", "top-right", "top-left"])
-        pos_row.addWidget(pos_lbl)
-        pos_row.addWidget(self._pos_cb, 1)
-        sb_lay.addLayout(pos_row)
-
-        sb_outer.addWidget(self._sb_opts)
-        lay.addWidget(self._sb_group)
-
-        # ── "No extra options" note for formats that don't need one ─────────
-        self._nooptions_lbl = QLabel(
-            "No extra options — the file will be written as-is."
-        )
-        self._nooptions_lbl.setWordWrap(True)
-        self._nooptions_lbl.setStyleSheet("color: gray; font-style: italic;")
-        lay.addWidget(self._nooptions_lbl)
-
-        lay.addStretch()
-
-        # ── Buttons ─────────────────────────────────────────────────────────
-        btn_row = QHBoxLayout()
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        ok_btn = QPushButton("Export…")
-        ok_btn.setObjectName("accentBtn")
-        ok_btn.clicked.connect(self.accept)
-        btn_row.addWidget(cancel_btn)
-        btn_row.addStretch()
-        btn_row.addWidget(ok_btn)
-        lay.addLayout(btn_row)
-
-        self._update_visible_options()
-
-    def _on_scalebar_toggled(self, checked: bool):
-        self._sb_opts.setEnabled(checked)
-
-    def _update_visible_options(self):
-        label = self._fmt_cb.currentText()
-        scalebar_fmts = ("PNG image", "PDF figure")
-        show_sb = label in scalebar_fmts
-        self._sb_group.setVisible(show_sb)
-        self._nooptions_lbl.setVisible(not show_sb)
-
-    def get_settings(self) -> dict:
-        """Return everything the caller needs to route to writers.save_scan.
-
-        Keys:
-            format_label : str    — human-readable dropdown entry
-            suffix       : str    — lower-case extension (no leading dot)
-            file_filter  : str    — QFileDialog filter pattern
-            add_scalebar / scalebar_unit / scalebar_pos  — only meaningful for PNG/PDF
-        """
-        idx = self._fmt_cb.currentIndex()
-        label, suffix, filt = _EXPORT_FORMATS[idx]
-
-        unit = "nm"
-        if self._ang_rb.isChecked():
-            unit = "Å"
-        elif self._pm_rb.isChecked():
-            unit = "pm"
-
-        return {
-            "format_label":  label,
-            "suffix":        suffix,
-            "file_filter":   filt,
-            "add_scalebar":  self._scalebar_cb.isChecked(),
-            "scalebar_unit": unit,
-            "scalebar_pos":  self._pos_cb.currentText(),
-        }
-
-
 # ── Convert panel ─────────────────────────────────────────────────────────────
 class ConvertPanel(QWidget):
     def __init__(self, t: dict, cfg: dict, parent=None):
@@ -5466,14 +5054,8 @@ class ProbeFlowWindow(QMainWindow):
         self._grid.selection_changed.connect(self._on_selection_changed)
         self._grid.view_requested.connect(self._open_viewer)
         self._grid.card_context_action.connect(self._on_card_context_action)
-        self._browse_tools.colormap_apply_requested.connect(self._on_apply_colormap)
-        self._browse_tools.scale_changed.connect(self._on_scale_changed)
-        self._browse_tools.processing_apply_requested.connect(self._on_processing_apply)
-        self._browse_tools.processing_apply_all_requested.connect(self._on_processing_apply_all)
-        self._browse_tools.autoclip_requested.connect(self._on_autoclip)
-        self._browse_tools.export_requested.connect(self._on_export)
-        self._browse_tools.undo_requested.connect(self._on_undo)
-        self._browse_tools.reset_requested.connect(self._on_reset)
+        self._browse_tools.colormap_changed.connect(self._on_thumbnail_colormap_changed)
+        self._browse_tools.thumbnail_align_changed.connect(self._on_thumbnail_align_changed)
         self._browse_tools.map_spectra_requested.connect(self._on_map_spectra)
         self._browse_tools.filter_changed.connect(self._on_filter_changed)
         self._browse_tools.thumbnail_channel_changed.connect(self._on_thumbnail_channel_changed)
@@ -5574,7 +5156,7 @@ class ProbeFlowWindow(QMainWindow):
         desc = ", ".join(parts) if parts else "0 files"
         self._status_bar.showMessage(
             f"Loaded {desc} — Double-click to view  |  "
-            "Select scans + Apply to colorize")
+            "Thumbnail controls update the whole browse grid")
         self._browse_info.clear()
 
     def _on_entry_select(self, entry):
@@ -5620,132 +5202,34 @@ class ProbeFlowWindow(QMainWindow):
                 f"Thumbnail channel: {channel} — queued {n} image thumbnail"
                 f"{'s' if n != 1 else ''}")
 
-    def _on_apply_colormap(self, cmap_key: str):
-        clip_low, clip_high = self._browse_tools.get_clip_values()
-        n = self._grid.set_colormap_for_selection(cmap_key,
-                                                   clip_low=clip_low,
-                                                   clip_high=clip_high)
+    def _on_thumbnail_colormap_changed(self, cmap_key: str):
+        n = self._grid.set_thumbnail_colormap(cmap_key)
+        label = next((l for l, k in CMAP_KEY.items() if k == cmap_key), cmap_key)
         if n == 0:
-            self._status_bar.showMessage(
-                "No images selected — click images first (Ctrl+click for multi-select)")
+            self._status_bar.showMessage(f"Thumbnail colormap: {label}")
         else:
-            label = next((l for l, k in CMAP_KEY.items() if k == cmap_key), cmap_key)
             self._status_bar.showMessage(
-                f"Applied {label} colormap to {n} image{'s' if n > 1 else ''}")
-            primary = self._grid.get_primary()
-            if primary:
-                entry = next((e for e in self._grid.get_entries()
-                              if e.stem == primary), None)
-                if entry:
-                    _, _, proc = self._grid.get_card_state(primary)
-                    self._browse_info.load_channels(entry, cmap_key, proc)
+                f"Thumbnail colormap: {label} — queued {n} image thumbnail"
+                f"{'s' if n != 1 else ''}")
+        self._refresh_primary_channel_previews()
 
-    def _on_scale_changed(self, clip_low: float, clip_high: float):
-        self._browse_info.update_clip(clip_low, clip_high)
-        n = self._grid.update_clip_for_selection(clip_low, clip_high)
-        if n > 0:
-            self._status_bar.showMessage(
-                f"Scale: {clip_low:.0f}%–{clip_high:.0f}% on {n} image{'s' if n > 1 else ''}")
-            primary = self._grid.get_primary()
-            if primary:
-                entry = next((e for e in self._grid.get_entries()
-                              if e.stem == primary), None)
-                if entry:
-                    cmap, _, proc = self._grid.get_card_state(primary)
-                    self._browse_info.load_channels(entry, cmap, proc)
-
-    def _on_processing_apply(self, cfg: dict):
-        clip_low, clip_high = self._browse_tools.get_clip_values()
-        cmap_key = CMAP_KEY.get(
-            self._browse_tools.cmap_cb.currentText(), DEFAULT_CMAP_KEY)
-        n = self._grid.set_colormap_for_selection(
-            cmap_key, clip_low=clip_low, clip_high=clip_high, processing=cfg)
+    def _on_thumbnail_align_changed(self, mode: str):
+        n = self._grid.set_thumbnail_align_rows(mode)
+        label = mode if mode in ("Median", "Mean") else "None"
         if n == 0:
-            self._status_bar.showMessage(
-                "No images selected — click images first")
+            self._status_bar.showMessage(f"Thumbnail align rows: {label}")
         else:
-            steps = []
-            if cfg.get('align_rows'):
-                steps.append(f"align({cfg['align_rows']})")
-            desc = ", ".join(steps) if steps else "none"
             self._status_bar.showMessage(
-                f"Quick corrections [{desc}] applied to {n} thumbnail{'s' if n > 1 else ''}")
-            primary = self._grid.get_primary()
-            if primary:
-                entry = next((e for e in self._grid.get_entries()
-                              if e.stem == primary), None)
-                if entry:
-                    self._browse_info.load_channels(entry, cmap_key, cfg)
+                f"Thumbnail align rows: {label} — queued {n} image thumbnail"
+                f"{'s' if n != 1 else ''}")
 
-    def _on_processing_apply_all(self, cfg: dict):
-        n = self._grid.set_processing_for_all_images(cfg)
-        if n == 0:
-            self._status_bar.showMessage("No scan thumbnails to update")
-            return
-
-        steps = []
-        if cfg.get('align_rows'):
-            steps.append(f"align({cfg['align_rows']})")
-        desc = ", ".join(steps) if steps else "none"
-        self._status_bar.showMessage(
-            f"Queued quick corrections [{desc}] for {n} thumbnail{'s' if n > 1 else ''}")
-
+    def _refresh_primary_channel_previews(self):
         primary = self._grid.get_primary()
         if primary:
             entry = next((e for e in self._grid.get_entries()
                           if e.stem == primary), None)
-            if entry:
-                cmap_key, _, proc = self._grid.get_card_state(primary)
-                self._browse_info.load_channels(entry, cmap_key, proc)
-
-    def _on_autoclip(self):
-        primary = self._grid.get_primary()
-        if not primary:
-            self._status_bar.showMessage("Select an image first for auto clip")
-            return
-        entry = next((e for e in self._grid.get_entries() if e.stem == primary), None)
-        if not entry:
-            return
-        try:
-            _scan = load_scan(entry.path)
-            arr = _scan.planes[0] if _scan.n_planes > 0 else None
-        except Exception:
-            arr = None
-        if arr is None:
-            self._status_bar.showMessage("Could not read scan data for auto clip")
-            return
-        try:
-            clip_low, clip_high = _proc.gmm_autoclip(arr)
-            self._browse_tools._low_slider.setValue(int(round(clip_low)))
-            self._browse_tools._high_slider.setValue(int(round(clip_high)))
-            self._status_bar.showMessage(
-                f"Auto clip: {clip_low:.1f}% – {clip_high:.1f}%")
-        except Exception as exc:
-            self._status_bar.showMessage(f"Auto clip error: {exc}")
-
-    def _on_undo(self):
-        selected = self._grid.get_selected()
-        if not selected:
-            self._status_bar.showMessage("Select an image first to undo")
-            return
-        n = self._grid.undo_last(selected)
-        if n == 0:
-            self._status_bar.showMessage("Nothing to undo — no history for current selection")
-        else:
-            self._status_bar.showMessage(f"Undo applied to {n} image{'s' if n > 1 else ''}")
-
-    def _on_reset(self):
-        selected = self._grid.get_selected()
-        if not selected:
-            self._status_bar.showMessage("Select an image first to reset")
-            return
-        n = self._grid.reset_to_original(selected)
-        if n == 0:
-            self._status_bar.showMessage(
-                "Nothing to reset — selected images already have no processing applied")
-        else:
-            self._status_bar.showMessage(
-                f"Reset to original applied to {n} image{'s' if n > 1 else ''}")
+            if entry and isinstance(entry, SxmFile):
+                self._browse_info.load_channels(entry, self._grid.thumbnail_colormap(), {})
 
     def _on_map_spectra(self):
         """Open the folder-level spec→image mapping dialog."""
@@ -5846,118 +5330,6 @@ class ProbeFlowWindow(QMainWindow):
             close_btn.clicked.connect(dlg.accept)
             v.addWidget(close_btn)
             dlg.exec()
-
-    def _on_export(self):
-        primary = self._grid.get_primary()
-        if not primary:
-            self._status_bar.showMessage("Select an image first")
-            return
-        entry = next((e for e in self._grid.get_entries() if e.stem == primary), None)
-        if not entry:
-            return
-
-        # Only topography entries are exportable through this dialog; spec
-        # entries are handled by the spec viewer.
-        if not hasattr(entry, "path") or entry.path.suffix.lower() == ".vert":
-            self._status_bar.showMessage(
-                "Selected entry isn't a topography scan — exporting .VERT "
-                "spectra uses the spec viewer."
-            )
-            return
-
-        t   = THEMES["dark" if self._dark else "light"]
-        dlg = ExportDialog(t, self)
-        dlg.setStyleSheet(QApplication.instance().styleSheet())
-        if dlg.exec() != QDialog.Accepted:
-            return
-        settings = dlg.get_settings()
-
-        suffix     = settings["suffix"]
-        filt       = settings["file_filter"]
-        label      = settings["format_label"]
-
-        _, _, proc_state = self._grid.get_card_state(entry.stem)
-        has_processing = gui_state_has_numeric_processing(proc_state)
-        out_stem = mark_processed_stem(entry.stem) if has_processing else entry.stem
-        suggested = str(Path.home() / f"{out_stem}.{suffix}")
-
-        if suffix == "sxm":
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Save as .sxm")
-            msg.setIcon(QMessageBox.Icon.Information)
-            if has_processing:
-                msg.setText(
-                    "The exported <b>.sxm</b> will include source provenance "
-                    "and processing operations in the <tt>COMMENT</tt> header field."
-                )
-            else:
-                msg.setText(
-                    "The exported <b>.sxm</b> will include source provenance "
-                    "(<tt>Source: &lt;filename&gt;</tt>) in the <tt>COMMENT</tt> header field."
-                )
-            msg.setInformativeText(f"Suggested filename: <b>{out_stem}.sxm</b>")
-            msg.setStandardButtons(
-                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
-            )
-            msg.setDefaultButton(QMessageBox.StandardButton.Ok)
-            if msg.exec() != QMessageBox.StandardButton.Ok:
-                return
-
-        out_path, _ = QFileDialog.getSaveFileName(
-            self, f"Save as {label}", suggested, filt)
-        if not out_path:
-            return
-
-        try:
-            scan = load_scan(entry.path)
-        except Exception as exc:
-            self._status_bar.showMessage(f"Could not read scan: {exc}")
-            return
-        if scan.n_planes == 0:
-            self._status_bar.showMessage("Could not read scan data")
-            return
-
-        apply_processing_state_to_scan(scan, proc_state, plane_idx=0)
-
-        clip_low, clip_high = self._browse_tools.get_clip_values()
-        cmap_key = self._grid._card_colormaps.get(entry.stem, DEFAULT_CMAP_KEY)
-
-        # Per-format kwargs forwarded to writers.save_scan.
-        kwargs: dict = {}
-        if suffix in ("png", "pdf"):
-            kwargs.update(
-                colormap=cmap_key,
-                clip_low=clip_low,
-                clip_high=clip_high,
-            )
-        if suffix == "png":
-            drs = DisplayRangeState(low_pct=clip_low, high_pct=clip_high)
-            ps = processing_state_from_gui(proc_state)
-            kwargs["provenance"] = build_scan_export_provenance(
-                scan,
-                channel_index=0,
-                processing_state=ps,
-                display_state=png_display_state(
-                    drs,
-                    colormap=cmap_key,
-                    add_scalebar=settings["add_scalebar"],
-                    scalebar_unit=settings["scalebar_unit"],
-                    scalebar_pos=settings["scalebar_pos"],
-                ),
-                export_kind="convert_png",
-                output_path=out_path,
-            )
-            kwargs.update(
-                add_scalebar=settings["add_scalebar"],
-                scalebar_unit=settings["scalebar_unit"],
-                scalebar_pos=settings["scalebar_pos"],
-            )
-
-        try:
-            scan.save(out_path, plane_idx=0, **kwargs)
-            self._status_bar.showMessage(f"Exported → {out_path}")
-        except Exception as exc:
-            self._status_bar.showMessage(f"Export error: {exc}")
 
     # ── Features tab handlers ──────────────────────────────────────────────────
     def _on_features_load_from_browse(self):
@@ -6080,10 +5452,6 @@ class ProbeFlowWindow(QMainWindow):
             dlg.exec()
         else:
             cmap_key, clip, proc = self._grid.get_card_state(entry.stem)
-            if entry.stem not in self._grid._card_clip:
-                # Always open new images with robust 1%–99% clip, independent
-                # of whatever the browse-tool scale sliders are set to.
-                clip = (1.0, 99.0)
             sxm_entries = [e for e in self._grid.get_entries() if isinstance(e, SxmFile)]
             initial_plane_idx = self._grid.thumbnail_plane_index_for_entry(entry)
             dlg = ImageViewerDialog(entry, sxm_entries, cmap_key, t, self,
@@ -6171,7 +5539,6 @@ class ProbeFlowWindow(QMainWindow):
 
     # ── Close ──────────────────────────────────────────────────────────────────
     def closeEvent(self, event):
-        cl, ch = self._browse_tools.get_clip_values()
         save_config({
             "dark_mode":     self._dark,
             "input_dir":     self._conv_panel.input_entry.text(),
@@ -6179,8 +5546,8 @@ class ProbeFlowWindow(QMainWindow):
             "custom_output": self._conv_panel._custom_out_cb.isChecked(),
             "do_png":        self._convert_sidebar.png_cb.isChecked(),
             "do_sxm":        self._convert_sidebar.sxm_cb.isChecked(),
-            "clip_low":      cl,
-            "clip_high":     ch,
+            "clip_low":      self._convert_sidebar.clip_low_spin.value(),
+            "clip_high":     self._convert_sidebar.clip_high_spin.value(),
             "colormap":      self._browse_tools.cmap_cb.currentText(),
             "browse_filter": self._browse_tools.get_filter_mode(),
         })
