@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 
 from probeflow.common import check_overwrite
+from probeflow.export_provenance import processing_state_from_history, processing_state_hash
 from probeflow.scan_model import Scan
 from probeflow.sxm_io import write_sxm_with_planes
 
@@ -30,6 +31,8 @@ def _build_comment(scan: Scan) -> str:
     """Format scan.processing_history into a human-readable COMMENT string."""
     source_name = scan.source_path.name if scan.source_path else "unknown"
     lines = [f"Source: {source_name}"]
+    ps = processing_state_from_history(scan.processing_history)
+    lines.append(f"ProcessingStateHash: {processing_state_hash(ps)}")
     if scan.processing_history:
         lines.append("Operations:")
         for i, entry in enumerate(scan.processing_history, 1):

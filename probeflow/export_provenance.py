@@ -9,7 +9,10 @@ All fields serialise to plain JSON via :meth:`ExportProvenance.to_dict`.
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib as _hashlib
+import json as _json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -59,6 +62,13 @@ class ExportProvenance:
     display_state:      dict[str, Any]               # DisplayRangeState.to_dict()
     probeflow_version:  str | None
     export_timestamp:   str                          # ISO-8601 UTC
+    export_kind:        str = "export"                # "png" | "prepared_png" | …
+    output_path:        str | None = None
+    source_id:          str | None = None
+    channel_id:         str | None = None
+    processing_state_hash: str | None = None
+    artifact_id:        str | None = None
+    warnings:           tuple[str, ...] = ()
 
     # ── Serialisation ─────────────────────────────────────────────────────────
 
@@ -77,6 +87,13 @@ class ExportProvenance:
             "display_state":     self.display_state,
             "probeflow_version": self.probeflow_version,
             "export_timestamp":  self.export_timestamp,
+            "export_kind":       self.export_kind,
+            "output_path":       self.output_path,
+            "source_id":         self.source_id,
+            "channel_id":        self.channel_id,
+            "processing_state_hash": self.processing_state_hash,
+            "artifact_id":       self.artifact_id,
+            "warnings":          list(self.warnings),
         }
 
     # ── Convenience constructor ───────────────────────────────────────────────
@@ -159,4 +176,136 @@ class ExportProvenance:
             display_state=ds_dict,
             probeflow_version=_get_version(),
             export_timestamp=_utc_now(),
+            source_id=_source_id(source_file),
+            channel_id=_channel_id(source_file, channel_index, channel_name),
+            processing_state_hash=processing_state_hash(ps_dict),
         )
+
+
+def processing_state_hash(processing_state: dict[str, Any]) -> str:
+    """Return a stable short hash for a serialised ProcessingState dict."""
+    payload = _json.dumps(processing_state or {"steps": []}, sort_keys=True, default=str)
+    return _hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def processing_state_from_history(history: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Convert ``Scan.processing_history`` into ProcessingState-like JSON.
+
+    This keeps writer-level provenance useful even when the caller has already
+    mutated a Scan and only the lightweight history entries remain available.
+    Timestamps are intentionally omitted from the canonical processing state;
+    they describe when a step was applied, not what numerical operation it is.
+    """
+    steps = []
+    for entry in history or []:
+        op = entry.get("op")
+        if not op:
+            continue
+        steps.append({"op": str(op), "params": dict(entry.get("params", {}))})
+    return {"steps": steps}
+
+
+def background_processing_warnings(processing_state: dict[str, Any]) -> tuple[str, ...]:
+    """Warnings for exports intended as downstream analysis inputs."""
+    bg_ops = {"plane_bg", "stm_line_bg", "facet_level"}
+    steps = processing_state.get("steps", []) if processing_state else []
+    if any(step.get("op") in bg_ops for step in steps):
+        return ()
+    return (
+        "No background/line-leveling operation is recorded; downstream tools "
+        "that consume PNGs may be sensitive to large tilt or background.",
+    )
+
+
+def build_scan_export_provenance(
+    scan: "Scan",
+    *,
+    channel_index: int = 0,
+    channel_name: str | None = None,
+    processing_state: "ProcessingState | dict[str, Any] | None" = None,
+    display_state: "DisplayRangeState | dict[str, Any] | None" = None,
+    export_kind: str = "export",
+    output_path=None,
+    warnings: tuple[str, ...] | list[str] | None = None,
+) -> ExportProvenance:
+    """Shared provenance constructor for GUI, CLI, writers, and handoffs."""
+    if processing_state is None:
+        ps_dict = processing_state_from_history(getattr(scan, "processing_history", []))
+    elif hasattr(processing_state, "to_dict"):
+        ps_dict = processing_state.to_dict()
+    else:
+        ps_dict = dict(processing_state)
+
+    if display_state is None:
+        ds_dict = {}
+    elif hasattr(display_state, "to_dict"):
+        ds_dict = display_state.to_dict()
+    else:
+        ds_dict = dict(display_state)
+
+    class _State:
+        def __init__(self, data):
+            self._data = data
+        def to_dict(self):
+            return self._data
+
+    prov = ExportProvenance.from_scan_export(
+        scan,
+        channel_index=channel_index,
+        channel_name=channel_name,
+        processing_state=_State(ps_dict),
+        display_state=_State(ds_dict),
+    )
+    out_str = str(output_path) if output_path is not None else None
+    artifact_id = _artifact_id(out_str, ps_dict)
+    return ExportProvenance(
+        source_file=prov.source_file,
+        source_format=prov.source_format,
+        item_type=prov.item_type,
+        channel_name=prov.channel_name,
+        channel_index=prov.channel_index,
+        array_shape=prov.array_shape,
+        scan_range_m=prov.scan_range_m,
+        units=prov.units,
+        processing_state=ps_dict,
+        display_state=ds_dict,
+        probeflow_version=prov.probeflow_version,
+        export_timestamp=prov.export_timestamp,
+        export_kind=str(export_kind),
+        output_path=out_str,
+        source_id=prov.source_id,
+        channel_id=prov.channel_id,
+        processing_state_hash=processing_state_hash(ps_dict),
+        artifact_id=artifact_id,
+        warnings=tuple(warnings or ()),
+    )
+
+
+def _source_id(source_file: str | None) -> str | None:
+    if not source_file:
+        return None
+    p = Path(source_file)
+    payload = f"{p.name}:{p.as_posix()}"
+    return _hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _channel_id(
+    source_file: str | None,
+    channel_index: int | None,
+    channel_name: str | None,
+) -> str | None:
+    if source_file is None and channel_index is None and channel_name is None:
+        return None
+    payload = (
+        f"{source_file or ''}:"
+        f"{channel_index if channel_index is not None else ''}:"
+        f"{channel_name or ''}"
+    )
+    return _hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _artifact_id(output_path: str | None, processing_state: dict[str, Any]) -> str | None:
+    if output_path is None:
+        return None
+    payload = f"{output_path}:{processing_state_hash(processing_state)}"
+    return _hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]

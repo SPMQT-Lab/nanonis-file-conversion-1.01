@@ -7,10 +7,12 @@ This uses the optional ``gwyfile`` package to serialise a top-level
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import numpy as np
 
 from probeflow.common import check_overwrite
+from probeflow.export_provenance import processing_state_from_history, processing_state_hash
 from probeflow.scan_model import Scan
 
 
@@ -47,8 +49,10 @@ def _plane_meta(
     meta["ProbeFlow scan width (m)"] = float(scan.scan_range_m[0])
     meta["ProbeFlow scan height (m)"] = float(scan.scan_range_m[1])
     meta["ProbeFlow num planes"] = int(scan.n_planes)
-    if scan.processing_history:
-        meta["ProbeFlow processing steps"] = int(len(scan.processing_history))
+    ps = processing_state_from_history(scan.processing_history)
+    meta["ProbeFlow processing state"] = json.dumps(ps, sort_keys=True)
+    meta["ProbeFlow processing state hash"] = processing_state_hash(ps)
+    meta["ProbeFlow processing steps"] = int(len(ps.get("steps", [])))
     return meta
 
 

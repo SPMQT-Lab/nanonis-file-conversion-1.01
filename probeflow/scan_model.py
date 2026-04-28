@@ -90,6 +90,7 @@ class Scan:
         add_scalebar: bool = True,
         scalebar_unit: str = "nm",
         scalebar_pos: str = "bottom-right",
+        provenance=None,
     ) -> None:
         """Render one plane to a colourised PNG with an optional scale bar."""
         from probeflow.writers.png import write_png
@@ -98,6 +99,7 @@ class Scan:
             colormap=colormap, clip_low=clip_low, clip_high=clip_high,
             add_scalebar=add_scalebar,
             scalebar_unit=scalebar_unit, scalebar_pos=scalebar_pos,
+            provenance=provenance,
         )
 
     def save_pdf(self, out_path, plane_idx: int = 0, **kwargs) -> None:

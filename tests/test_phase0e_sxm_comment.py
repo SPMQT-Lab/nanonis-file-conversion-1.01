@@ -32,7 +32,8 @@ class TestBuildComment:
     def test_no_history_gives_source_only(self):
         scan = self._scan_stub("scan.sxm")
         comment = _build_comment(scan)
-        assert comment == "Source: scan.sxm"
+        assert comment.startswith("Source: scan.sxm")
+        assert "ProcessingStateHash:" in comment
         assert "Operations" not in comment
 
     def test_history_includes_source_and_ops(self):

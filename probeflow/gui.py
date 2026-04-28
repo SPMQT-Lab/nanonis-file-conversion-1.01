@@ -68,6 +68,7 @@ from probeflow.display import (
     histogram_from_array as _histogram_from_array,
 )
 from probeflow.display_state import DisplayRangeState
+from probeflow.export_provenance import build_scan_export_provenance
 from probeflow.gui_processing import (
     NUMERIC_PROC_KEYS,
     apply_processing_state_to_scan,
@@ -3423,15 +3424,16 @@ class ImageViewerDialog(QDialog):
             provenance = None
             if _scan is not None:
                 try:
-                    from probeflow.export_provenance import ExportProvenance
                     ch_idx = self._ch_cb.currentIndex()
                     ps = processing_state_from_gui(self._processing or {})
-                    provenance = ExportProvenance.from_scan_export(
+                    provenance = build_scan_export_provenance(
                         _scan,
                         channel_index=ch_idx,
                         channel_name=PLANE_NAMES[ch_idx] if 0 <= ch_idx < len(PLANE_NAMES) else None,
                         processing_state=ps,
                         display_state=self._drs,
+                        export_kind="viewer_png",
+                        output_path=out_path,
                     )
                 except Exception:
                     pass
@@ -5681,6 +5683,16 @@ class ProbeFlowWindow(QMainWindow):
                 clip_high=clip_high,
             )
         if suffix == "png":
+            drs = DisplayRangeState(low_pct=clip_low, high_pct=clip_high)
+            ps = processing_state_from_gui(proc_state)
+            kwargs["provenance"] = build_scan_export_provenance(
+                scan,
+                channel_index=0,
+                processing_state=ps,
+                display_state=drs,
+                export_kind="convert_png",
+                output_path=out_path,
+            )
             kwargs.update(
                 add_scalebar=settings["add_scalebar"],
                 scalebar_unit=settings["scalebar_unit"],

@@ -22,7 +22,12 @@ import numpy as np
 import pytest
 
 from probeflow.display_state import DisplayRangeState
-from probeflow.export_provenance import ExportProvenance
+from probeflow.export_provenance import (
+    ExportProvenance,
+    background_processing_warnings,
+    build_scan_export_provenance,
+    processing_state_hash,
+)
 from probeflow.processing_state import ProcessingState, ProcessingStep
 from probeflow.writers.json import write_json
 
@@ -86,7 +91,9 @@ class TestToDict:
         for key in ("source_file", "source_format", "item_type", "channel_name",
                     "channel_index", "array_shape", "scan_range_m", "units",
                     "processing_state", "display_state",
-                    "probeflow_version", "export_timestamp"):
+                    "probeflow_version", "export_timestamp", "export_kind",
+                    "source_id", "channel_id", "processing_state_hash",
+                    "artifact_id", "warnings"):
             assert key in d, f"Key '{key}' missing from to_dict()"
 
     def test_array_shape_serialised_as_list(self):
@@ -240,6 +247,43 @@ class TestFromScanExport:
             scan, channel_index=0, processing_state=ps, display_state=drs
         )
         json.dumps(prov.to_dict())
+
+    def test_processing_state_hash_is_stable(self):
+        state_a = {"steps": [{"op": "plane_bg", "params": {"order": 1, "fit_rect": (1, 2, 3, 4)}}]}
+        state_b = {"steps": [{"params": {"fit_rect": (1, 2, 3, 4), "order": 1}, "op": "plane_bg"}]}
+        assert processing_state_hash(state_a) == processing_state_hash(state_b)
+
+    def test_shared_builder_adds_ids_and_output_context(self, tmp_path):
+        scan = _make_scan(source_path="/data/scan.dat")
+        ps = ProcessingState(steps=[ProcessingStep("plane_bg", {"order": 1})])
+        drs = DisplayRangeState()
+        out = tmp_path / "prepared.png"
+
+        prov = build_scan_export_provenance(
+            scan,
+            channel_index=0,
+            processing_state=ps,
+            display_state=drs,
+            export_kind="prepared_png",
+            output_path=out,
+        )
+        data = prov.to_dict()
+        assert data["export_kind"] == "prepared_png"
+        assert data["output_path"] == str(out)
+        assert data["source_id"]
+        assert data["channel_id"]
+        assert data["artifact_id"]
+        assert data["processing_state_hash"] == processing_state_hash(ps.to_dict())
+
+    def test_background_warning_absent_when_background_recorded(self):
+        state = {"steps": [{"op": "stm_line_bg", "params": {"mode": "step_tolerant"}}]}
+        assert background_processing_warnings(state) == ()
+
+    def test_background_warning_present_without_background(self):
+        state = {"steps": [{"op": "smooth", "params": {"sigma_px": 1.0}}]}
+        warnings = background_processing_warnings(state)
+        assert len(warnings) == 1
+        assert "background" in warnings[0]
 
 
 # ── C: DisplayRangeState.to_dict() preserves mode and limits ─────────────────
@@ -472,3 +516,86 @@ class TestPngNoRegression:
         sidecar = out.with_suffix("").with_suffix(".provenance.json")
         assert out.exists(), "PNG not written"
         assert sidecar.exists(), "Sidecar not written via write_png"
+
+    def test_prepared_png_export_writes_handoff_sidecar_warning(self, tmp_path):
+        from probeflow.prepared_export import write_prepared_png
+
+        scan = _make_scan()
+        out = tmp_path / "aisurf_input.png"
+        write_prepared_png(
+            scan,
+            out,
+            processing_state=ProcessingState(steps=[
+                ProcessingStep("smooth", {"sigma_px": 1.0}),
+            ]),
+            add_scalebar=False,
+        )
+
+        sidecar = out.with_suffix("").with_suffix(".provenance.json")
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+        assert data["export_kind"] == "prepared_png"
+        assert data["warnings"]
+        assert data["processing_state"]["steps"][0]["op"] == "smooth"
+
+    def test_prepared_png_export_omits_warning_after_background(self, tmp_path):
+        from probeflow.prepared_export import write_prepared_png
+
+        scan = _make_scan()
+        out = tmp_path / "aisurf_input.png"
+        write_prepared_png(
+            scan,
+            out,
+            processing_state=ProcessingState(steps=[
+                ProcessingStep("plane_bg", {"order": 1}),
+            ]),
+            add_scalebar=False,
+        )
+
+        sidecar = out.with_suffix("").with_suffix(".provenance.json")
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+        assert data["export_kind"] == "prepared_png"
+        assert data["warnings"] == []
+        assert data["processing_state_hash"]
+
+    def test_cli_sxm2png_writes_standard_sidecar(self, tmp_path):
+        from probeflow.cli import main as cli_main
+
+        src = (
+            Path(__file__).resolve().parents[1]
+            / "anonymised_testdata"
+            / "sxm_moire_10nm.sxm"
+        )
+        out = tmp_path / "moire.png"
+        rc = cli_main(["sxm2png", str(src), "-o", str(out), "--no-scalebar"])
+
+        assert rc == 0
+        sidecar = out.with_suffix("").with_suffix(".provenance.json")
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+        assert data["export_kind"] == "cli_sxm2png"
+        assert data["processing_state"] == {"steps": []}
+        assert data["display_state"]["mode"] == "percentile"
+        assert data["source_id"]
+
+    def test_cli_pipeline_png_records_processing_sidecar(self, tmp_path):
+        from probeflow.cli import main as cli_main
+
+        src = (
+            Path(__file__).resolve().parents[1]
+            / "anonymised_testdata"
+            / "sxm_moire_10nm.sxm"
+        )
+        out = tmp_path / "moire_processed.png"
+        rc = cli_main([
+            "pipeline", str(src),
+            "--steps", "align-rows:median", "plane-bg:1",
+            "--png", "-o", str(out),
+            "--no-scalebar",
+        ])
+
+        assert rc == 0
+        sidecar = out.with_suffix("").with_suffix(".provenance.json")
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+        ops = [step["op"] for step in data["processing_state"]["steps"]]
+        assert data["export_kind"] == "cli_png"
+        assert ops == ["align_rows", "plane_bg"]
+        assert data["processing_state_hash"]

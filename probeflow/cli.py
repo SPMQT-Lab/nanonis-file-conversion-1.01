@@ -178,6 +178,7 @@ def _write_output(
     if args.png:
         out_path = _derive_output(args, ".png" if default_suffix == ".sxm"
                                    else default_suffix)
+        provenance = _cli_png_provenance(scan, args.plane, args, out_path, "cli_png")
         scan.save_png(
             out_path,
             plane_idx=args.plane,
@@ -187,12 +188,33 @@ def _write_output(
             add_scalebar=not args.no_scalebar,
             scalebar_unit=args.scalebar_unit,
             scalebar_pos=args.scalebar_pos,
+            provenance=provenance,
         )
     else:
         out_path = _derive_output(args, default_suffix)
         scan.save_sxm(out_path)
     log.info("[OK] %s → %s", args.input.name, out_path)
     return out_path
+
+
+def _cli_png_provenance(scan: Scan, plane_idx: int, args, out_path, export_kind: str):
+    """Build standard provenance for CLI PNG-style exports."""
+    from probeflow.display_state import DisplayRangeState
+    from probeflow.export_provenance import build_scan_export_provenance
+
+    clip_low = getattr(args, "clip_low", 1.0)
+    clip_high = getattr(args, "clip_high", 99.0)
+    drs = DisplayRangeState(
+        low_pct=float(1.0 if clip_low is None else clip_low),
+        high_pct=float(99.0 if clip_high is None else clip_high),
+    )
+    return build_scan_export_provenance(
+        scan,
+        channel_index=plane_idx,
+        display_state=drs,
+        export_kind=export_kind,
+        output_path=out_path,
+    )
 
 
 # ─── Pipeline atoms (each returns an _Op) ────────────────────────────────────
@@ -345,6 +367,7 @@ def _cmd_sxm2png(args) -> int:
                   args.plane, scan.n_planes)
         return 1
     out = args.output or args.input.with_suffix(".png")
+    provenance = _cli_png_provenance(scan, args.plane, args, out, "cli_sxm2png")
     scan.save_png(
         out, plane_idx=args.plane,
         colormap=args.colormap,
@@ -352,6 +375,7 @@ def _cmd_sxm2png(args) -> int:
         add_scalebar=not args.no_scalebar,
         scalebar_unit=args.scalebar_unit,
         scalebar_pos=args.scalebar_pos,
+        provenance=provenance,
     )
     log.info("[OK] %s → %s", args.input.name, out)
     return 0
@@ -482,6 +506,9 @@ def _cmd_convert(args) -> int:
         extra["clip_low"] = args.clip_low
     if args.clip_high is not None:
         extra["clip_high"] = args.clip_high
+    if out.suffix.lower() == ".png":
+        extra["provenance"] = _cli_png_provenance(
+            scan, args.plane, args, out, "cli_convert_png")
 
     try:
         scan.save(out, plane_idx=args.plane, **extra)
