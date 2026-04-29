@@ -12,6 +12,8 @@ from typing import List, Optional, Union
 import numpy as np
 from PIL import Image
 
+import os as _os
+_os.environ.setdefault("QT_API", "pyside6")
 import matplotlib
 matplotlib.use("QtAgg")
 from matplotlib.figure import Figure
