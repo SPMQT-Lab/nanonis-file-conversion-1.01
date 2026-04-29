@@ -21,17 +21,9 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 
-# ─── Lazy imports ────────────────────────────────────────────────────────────
+# ─── Shared helpers (lazy cv2 + uint8 conversion live in features) ───────────
 
-def _cv():
-    try:
-        import cv2
-    except ImportError as exc:  # pragma: no cover
-        raise ImportError(
-            "OpenCV is required for lattice extraction. "
-            "Install with `pip install probeflow[features]`."
-        ) from exc
-    return cv2
+from probeflow.features import _cv, _to_uint8
 
 
 def _sk_cluster():
@@ -93,15 +85,6 @@ class LatticeResult:
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
-
-def _to_uint8(arr: np.ndarray, clip_low: float, clip_high: float) -> np.ndarray:
-    from probeflow.display import array_to_uint8
-
-    try:
-        return array_to_uint8(arr, clip_percentiles=(clip_low, clip_high))
-    except ValueError:
-        return np.zeros(np.asarray(arr).shape, dtype=np.uint8)
-
 
 def _angle_between_deg(u: np.ndarray, v: np.ndarray) -> float:
     uu = u / (np.linalg.norm(u) + 1e-12)

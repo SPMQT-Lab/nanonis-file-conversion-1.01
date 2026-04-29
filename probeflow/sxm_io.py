@@ -43,23 +43,6 @@ _PRE_PAYLOAD_BYTES_CACHE: Optional[bytes] = None
 _SCANIT_END_MARKER = b":SCANIT_END:"
 
 
-def _data_offset(cushion_dir: Optional[Path] = None) -> int:
-    """Return the reference cushion's fixed data offset.
-
-    Used as a sanity-check fallback; most call sites prefer
-    :func:`_data_offset_in_file` which scans the actual file for
-    ``:SCANIT_END:`` and is robust to headers of any length.
-    """
-    global _DATA_OFFSET_CACHE
-    if cushion_dir is None and _DATA_OFFSET_CACHE is not None:
-        return _DATA_OFFSET_CACHE
-    cushion_dir = Path(cushion_dir) if cushion_dir else _DEFAULT_CUSHION_DIR
-    offset = int((cushion_dir / "data_offset.txt").read_text(encoding="utf-8").strip())
-    if cushion_dir == _DEFAULT_CUSHION_DIR:
-        _DATA_OFFSET_CACHE = offset
-    return offset
-
-
 def _cushion_tail_lens(cushion_dir: Optional[Path] = None) -> Tuple[int, int]:
     """Return ``(len(post_end_bytes), len(pre_payload_bytes))`` from the cushion."""
     global _POST_END_BYTES_CACHE, _PRE_PAYLOAD_BYTES_CACHE

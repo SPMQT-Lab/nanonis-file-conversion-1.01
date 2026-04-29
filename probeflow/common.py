@@ -170,13 +170,6 @@ def _i(x, default=None):
         return default
 
 
-def mark_processed_stem(stem: str) -> str:
-    """Return stem with _processed appended, unless already present."""
-    if stem.endswith("_processed"):
-        return stem
-    return f"{stem}_processed"
-
-
 def check_overwrite(input_path: Path, output_path: Path) -> None:
     """Raise ValueError if output_path resolves to the same file as input_path."""
     if Path(input_path).resolve() == Path(output_path).resolve():

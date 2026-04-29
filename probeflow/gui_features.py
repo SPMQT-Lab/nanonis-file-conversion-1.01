@@ -55,6 +55,7 @@ def _sep() -> QFrame:
     line = QFrame()
     line.setFrameShape(QFrame.HLine)
     line.setFrameShadow(QFrame.Sunken)
+    line.setFixedHeight(1)
     return line
 
 
