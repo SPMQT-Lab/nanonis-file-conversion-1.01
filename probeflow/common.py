@@ -134,25 +134,16 @@ def trim_stack(stack: np.ndarray) -> Tuple[np.ndarray, int]:
 
 def percentile_clip(arr: np.ndarray, low: float = 1.0, high: float = 99.0) -> Tuple[float, float]:
     """Return (vmin, vmax) from finite values using percentile clipping."""
-    finite = arr[np.isfinite(arr)]
-    if finite.size == 0:
-        return 0.0, 1.0
-    vmin = float(np.percentile(finite, low))
-    vmax = float(np.percentile(finite, high))
-    if not (np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin):
-        vmin = float(np.nanmin(finite))
-        vmax = float(np.nanmax(finite))
-    if not (np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin):
-        return 0.0, 1.0
-    return vmin, vmax
+    from probeflow.display import clip_range_from_array
+
+    return clip_range_from_array(arr, low, high)
 
 
 def to_uint8(arr: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
     """Linearly map [vmin, vmax] → [0, 255] uint8."""
-    x = np.array(arr, dtype=np.float32)
-    x = np.clip(x, vmin, vmax)
-    x = (x - vmin) / (vmax - vmin) if vmax > vmin else np.zeros_like(x)
-    return (np.clip(x, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    from probeflow.display import array_to_uint8
+
+    return array_to_uint8(arr, vmin=vmin, vmax=vmax)
 
 
 def setup_logging(verbose: bool = False) -> None:

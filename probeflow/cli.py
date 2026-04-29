@@ -66,22 +66,6 @@ from probeflow.sxm_io import (
 log = logging.getLogger(__name__)
 
 
-# ─── Colormap helpers (no PySide6 dependency) ────────────────────────────────
-
-def _lut_from_matplotlib(name: str) -> np.ndarray:
-    """Return a (256, 3) uint8 LUT from a matplotlib colormap name."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg", force=False)  # avoid starting Qt from the CLI
-        from matplotlib import colormaps
-        cmap = colormaps.get_cmap(name)
-    except Exception:
-        # Fallback to gray
-        return np.stack([np.arange(256, dtype=np.uint8)] * 3, axis=1)
-    rgba = (cmap(np.linspace(0, 1, 256))[:, :3] * 255.0).astype(np.uint8)
-    return rgba
-
-
 # ─── Processing-op wrapper ───────────────────────────────────────────────────
 
 class _Op:

@@ -245,15 +245,14 @@ class TestPercentileClip:
 
     def test_all_nan(self):
         arr = np.full((10,), np.nan)
-        vmin, vmax = percentile_clip(arr)
-        assert vmin == 0.0
-        assert vmax == 1.0
+        with pytest.raises(ValueError):
+            percentile_clip(arr)
 
     def test_constant_array(self):
         arr = np.ones(100)
         vmin, vmax = percentile_clip(arr)
         assert vmin == 0.0
-        assert vmax == 1.0
+        assert vmax == 2.0
 
 
 # ─── to_uint8 ─────────────────────────────────────────────────────────────────

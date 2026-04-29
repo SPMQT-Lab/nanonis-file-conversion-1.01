@@ -1,29 +1,22 @@
-"""Convert Nanonis .dat files to preview PNG images."""
+"""Convert Createc .dat scan files to preview PNG images."""
 
 import argparse
 import json
 import logging
-import zlib
 from pathlib import Path
 
-import numpy as np
 from PIL import Image
 
 from .common import (
-    _f, _i,
-    detect_channels,
-    find_hdr,
     get_dac_bits,
     i_scale_a_per_dac,
-    parse_header,
-    percentile_clip,
     sanitize,
     setup_logging,
-    to_uint8,
-    trim_stack,
     v_per_dac,
     z_scale_m_per_dac,
 )
+from .display import array_to_uint8
+from .scan import load_scan
 
 log = logging.getLogger(__name__)
 
@@ -39,93 +32,54 @@ def dat_to_hdr_imgs(
     clip_high: float = 99.0,
 ) -> dict:
     """Convert a single .dat file to a header text file and PNG images."""
-    raw = dat_path.read_bytes()
-
-    if b"DATA" not in raw:
-        raise ValueError(
-            f"{dat_path.name}: missing DATA marker — not a valid Nanonis .dat file"
-        )
-
-    hb, comp = raw.split(b"DATA", 1)
-    hdr = parse_header(hb)
-
-    Nx = _i(find_hdr(hdr, "Num.X", 0), 0)
-    Ny = _i(find_hdr(hdr, "Num.Y", 0), 0)
-    if Nx <= 0 or Ny <= 0:
-        raise ValueError(
-            f"{dat_path.name}: invalid pixel dimensions Nx={Nx}, Ny={Ny}"
-        )
-
-    if _i(find_hdr(hdr, "ScanmodeSine", 0), 0) != 0:
-        raise NotImplementedError(
-            f"{dat_path.name}: sine scan mode is not supported"
-        )
-
-    log.debug("%s: Nx=%d, Ny=%d", dat_path.name, Nx, Ny)
-
+    dat_path = Path(dat_path)
     try:
-        payload = zlib.decompress(comp)
-    except zlib.error as exc:
-        raise ValueError(
-            f"{dat_path.name}: zlib decompression failed — {exc}"
-        ) from exc
-
-    stack, num_chan = detect_channels(payload, Ny, Nx)
-    log.info("%s: %d channels detected", dat_path.name, num_chan)
-
-    stack, Ny = trim_stack(stack)
-
+        scan = load_scan(dat_path)
+    except ValueError as exc:
+        if dat_path.suffix.lower() == ".dat" and b"DATA" not in dat_path.read_bytes():
+            raise ValueError(
+                f"{dat_path.name}: missing DATA marker — not a valid Createc .dat file"
+            ) from exc
+        raise
+    hdr = scan.header
+    Nx, Ny = scan.dims
+    synthetic = list(getattr(scan, "plane_synthetic", []) or [])
+    num_chan = 2 if scan.n_planes >= 4 and any(synthetic) else scan.n_planes
     bits = get_dac_bits(hdr)
     vpd = v_per_dac(bits)
     zs = z_scale_m_per_dac(hdr, vpd)
     is_ = i_scale_a_per_dac(hdr, vpd)
-
     log.debug(
         "%s: DAC bits=%d, V/DAC=%.3e, Z=%.3e m/DAC, I=%.3e A/DAC",
         dat_path.name, bits, vpd, zs, is_,
     )
 
-    # Apply physical scaling in-place: even indices = Z, odd = current
-    for k in range(num_chan):
-        stack[k] = (stack[k] * (zs if k % 2 == 0 else is_)).astype(np.float32)
-
-    origin_upper = str(find_hdr(hdr, "ScanYDirec", "1")).strip() == "1"
-
-    # Channel layout from Nanonis .dat: [FT, FC, BT, BC]
-    if num_chan == 4:
-        imgs = [
-            ("Z",       "m", "forward",  stack[0]),
-            ("Z",       "m", "backward", stack[2]),
-            ("Current", "A", "forward",  stack[1]),
-            ("Current", "A", "backward", stack[3]),
-        ]
-    else:
-        imgs = [
-            ("Z",       "m", "forward", stack[0]),
-            ("Current", "A", "forward", stack[1]),
-        ]
-
     out_dir.mkdir(parents=True, exist_ok=True)
 
     with open(out_dir / "hdr.txt", "w", encoding="utf-8") as f:
-        for line in hb.splitlines():
-            if b"=" in line:
-                key, val = line.split(b"=", 1)
-                field = key.decode("ascii", "ignore").split("/")[-1].strip()
-                f.write(f"{field}: {val.decode('ascii', 'ignore').strip()}\n")
+        for key, val in hdr.items():
+            f.write(f"{key}: {val}\n")
 
     png_dir = out_dir / "pngs"
     png_dir.mkdir(parents=True, exist_ok=True)
 
-    for k, (nm, _un, dr, arr_) in enumerate(imgs):
-        disp = np.fliplr(arr_) if dr == "backward" else arr_.copy()
-        vmin, vmax = percentile_clip(disp, clip_low, clip_high)
-        u8 = to_uint8(disp, vmin, vmax)
-        if origin_upper:
-            u8 = np.flipud(u8)
+    if num_chan == 2 and scan.n_planes >= 4:
+        plane_indices = [0, 2]
+    else:
+        plane_indices = list(range(scan.n_planes))
+
+    for k, plane_idx in enumerate(plane_indices):
+        arr = scan.planes[plane_idx]
+        name = scan.plane_names[plane_idx] if plane_idx < len(scan.plane_names) else f"Plane {plane_idx}"
+        parts = name.rsplit(" ", 1)
+        if len(parts) == 2 and parts[1].lower() in {"forward", "backward"}:
+            nm, dr = parts[0], parts[1].lower()
+        else:
+            nm, dr = name, "forward"
+        u8 = array_to_uint8(arr, clip_percentiles=(clip_low, clip_high))
         fname = f"img_{k:02d}_{sanitize(nm)}_{dr}.png"
         Image.fromarray(u8, mode="L").save(png_dir / fname)
-        log.debug("Saved %s (vmin=%.3e, vmax=%.3e)", fname, vmin, vmax)
+        log.debug("Saved %s", fname)
 
     return {
         "Nx": Nx,

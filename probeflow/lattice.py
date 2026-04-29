@@ -95,19 +95,12 @@ class LatticeResult:
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
 def _to_uint8(arr: np.ndarray, clip_low: float, clip_high: float) -> np.ndarray:
-    a = arr.astype(np.float64, copy=False)
-    finite = a[np.isfinite(a)]
-    if finite.size == 0:
-        return np.zeros(a.shape, dtype=np.uint8)
-    vmin = float(np.percentile(finite, clip_low))
-    vmax = float(np.percentile(finite, clip_high))
-    if vmax <= vmin:
-        vmin, vmax = float(finite.min()), float(finite.max())
-    if vmax <= vmin:
-        vmax = vmin + 1.0
-    safe = np.where(np.isfinite(a), a, vmin)
-    u8 = np.clip((safe - vmin) / (vmax - vmin) * 255.0, 0, 255)
-    return u8.astype(np.uint8)
+    from probeflow.display import array_to_uint8
+
+    try:
+        return array_to_uint8(arr, clip_percentiles=(clip_low, clip_high))
+    except ValueError:
+        return np.zeros(np.asarray(arr).shape, dtype=np.uint8)
 
 
 def _angle_between_deg(u: np.ndarray, v: np.ndarray) -> float:

@@ -239,6 +239,25 @@ class SxmFile:
     scan_nm:       Optional[float] = None
     source_format: str            = "sxm"
 
+    @classmethod
+    def from_index_item(cls, item) -> "SxmFile":
+        """Build the legacy GUI scan entry from a package-level ProbeFlowItem."""
+        fmt = {"createc_dat": "dat", "nanonis_sxm": "sxm"}.get(
+            item.source_format, item.source_format)
+        if item.load_error or item.shape is None:
+            return cls(path=item.path, stem=item.path.stem, source_format=fmt)
+        Ny, Nx = item.shape
+        return cls(
+            path=item.path,
+            stem=item.path.stem,
+            Nx=Nx,
+            Ny=Ny,
+            bias_mv=item.bias * 1000 if item.bias is not None else None,
+            current_pa=item.setpoint * 1e12 if item.setpoint is not None else None,
+            scan_nm=item.scan_range[0] * 1e9 if item.scan_range else None,
+            source_format=fmt,
+        )
+
 
 @dataclass
 class VertFile:
@@ -248,6 +267,20 @@ class VertFile:
     n_points:     int            = 0
     bias_mv:      Optional[float] = None
     spec_freq_hz: Optional[float] = None
+
+    @classmethod
+    def from_index_item(cls, item) -> "VertFile":
+        """Build the legacy GUI spectroscopy entry from a ProbeFlowItem."""
+        if item.load_error:
+            return cls(path=item.path, stem=item.path.stem)
+        return cls(
+            path=item.path,
+            stem=item.path.stem,
+            sweep_type=str(item.metadata.get("sweep_type") or "unknown"),
+            n_points=int(item.metadata.get("n_points") or 0),
+            bias_mv=item.bias * 1000 if item.bias is not None else None,
+            spec_freq_hz=item.metadata.get("spec_freq_hz"),
+        )
 
 
 def _card_meta_str(entry: SxmFile) -> str:
@@ -375,32 +408,6 @@ def _apply_processing(
     """
     from probeflow.processing_state import apply_processing_state
     return apply_processing_state(arr, processing_state_from_gui(processing or {}))
-
-
-def _render_scan_array(
-    arr: np.ndarray,
-    colormap: str = "gray",
-    clip_low: float = 1.0,
-    clip_high: float = 99.0,
-    size: tuple | None = (148, 116),
-    vmin: Optional[float] = None,
-    vmax: Optional[float] = None,
-    allow_upscale: bool = False,
-) -> Optional[Image.Image]:
-    if vmin is None or vmax is None:
-        vmin, vmax = clip_range_from_arr(arr, clip_low, clip_high)
-    if vmin is None:
-        return None
-
-    u8 = _array_to_uint8(arr, vmin=vmin, vmax=vmax)
-    colored = _get_lut(colormap)[u8]
-    img = Image.fromarray(colored, mode="RGB")
-    if size:
-        if allow_upscale:
-            img = _fit_image_to_box(img, size)
-        else:
-            img.thumbnail(size, Image.LANCZOS)
-    return img
 
 
 def render_scan_thumbnail(
@@ -608,26 +615,13 @@ def _scan_items_to_sxm(items) -> list[SxmFile]:
     if two files share a stem, only the first (by index_folder sort order)
     is kept.
     """
-    _fmt = {"createc_dat": "dat", "nanonis_sxm": "sxm"}
     seen: set[str] = set()
     result: list[SxmFile] = []
     for item in items:
         if item.item_type != "scan" or item.path.stem in seen:
             continue
         seen.add(item.path.stem)
-        src_fmt = _fmt.get(item.source_format, item.source_format)
-        if item.load_error or item.shape is None:
-            result.append(SxmFile(path=item.path, stem=item.path.stem, source_format=src_fmt))
-        else:
-            Ny, Nx = item.shape
-            result.append(SxmFile(
-                path=item.path, stem=item.path.stem,
-                Nx=Nx, Ny=Ny,
-                bias_mv=item.bias * 1000 if item.bias is not None else None,
-                current_pa=item.setpoint * 1e12 if item.setpoint is not None else None,
-                scan_nm=item.scan_range[0] * 1e9 if item.scan_range else None,
-                source_format=src_fmt,
-            ))
+        result.append(SxmFile.from_index_item(item))
     return result
 
 
@@ -637,17 +631,7 @@ def _spec_items_to_vert(items) -> list[VertFile]:
     for item in items:
         if item.item_type != "spectrum":
             continue
-        if item.load_error:
-            result.append(VertFile(path=item.path, stem=item.path.stem))
-        else:
-            result.append(VertFile(
-                path=item.path,
-                stem=item.path.stem,
-                sweep_type=str(item.metadata.get("sweep_type") or "unknown"),
-                n_points=int(item.metadata.get("n_points") or 0),
-                bias_mv=item.bias * 1000 if item.bias is not None else None,
-                spec_freq_hz=item.metadata.get("spec_freq_hz"),
-            ))
+        result.append(VertFile.from_index_item(item))
     return result
 
 
@@ -940,24 +924,23 @@ class ConversionWorker(QRunnable):
             self.signals.finished.emit(self.out_dir)
 
 
-# ── ScanCard ──────────────────────────────────────────────────────────────────
-class ScanCard(QFrame):
-    """Single thumbnail card. Supports single-click, Ctrl+click, and double-click."""
+# ── Browse cards ──────────────────────────────────────────────────────────────
+class _BrowseCard(QFrame):
+    """Shared thumbnail-card behavior for image and spectroscopy entries."""
+
     clicked        = Signal(object, bool)  # SxmFile, ctrl_held
-    double_clicked = Signal(object)        # SxmFile
-    context_action_requested = Signal(object, str)  # SxmFile, action key
+    double_clicked = Signal(object)
 
     CARD_W = 200
     CARD_H = 220
     IMG_W  = 180
     IMG_H  = 150
 
-    def __init__(self, entry: SxmFile, t: dict, parent=None):
+    def __init__(self, entry, t: dict, meta_text: str, parent=None):
         super().__init__(parent)
         self.entry     = entry
         self._t        = t
         self._sel      = False
-        self._colormap = DEFAULT_CMAP_KEY
 
         self.setFixedSize(self.CARD_W, self.CARD_H)
         self.setCursor(QCursor(Qt.PointingHandCursor))
@@ -976,7 +959,7 @@ class ScanCard(QFrame):
         self.name_lbl.setAlignment(Qt.AlignCenter)
         self.name_lbl.setFont(QFont("Helvetica", 10))
 
-        self.meta_lbl = QLabel(_card_meta_str(entry))
+        self.meta_lbl = QLabel(meta_text)
         self.meta_lbl.setAlignment(Qt.AlignCenter)
         self.meta_lbl.setFont(QFont("Helvetica", 9))
 
@@ -1005,13 +988,14 @@ class ScanCard(QFrame):
             bg, border, bw, fg = t["card_sel"], t["accent_bg"], 3, t["accent_bg"]
         else:
             bg, border, bw, fg = t["card_bg"], t["sep"], 1, t["card_fg"]
+        selector = self.__class__.__name__
         self.setStyleSheet(f"""
-            ScanCard {{
+            {selector} {{
                 background-color: {bg};
                 border: {bw}px solid {border};
                 border-radius: 6px;
             }}
-            ScanCard:hover {{
+            {selector}:hover {{
                 border: {bw}px solid {t["accent_bg"]};
             }}
         """)
@@ -1029,6 +1013,15 @@ class ScanCard(QFrame):
         if event.button() == Qt.LeftButton:
             self.double_clicked.emit(self.entry)
         super().mouseDoubleClickEvent(event)
+
+
+class ScanCard(_BrowseCard):
+    """Single image thumbnail card."""
+
+    context_action_requested = Signal(object, str)  # SxmFile, action key
+
+    def __init__(self, entry: SxmFile, t: dict, parent=None):
+        super().__init__(entry, t, _card_meta_str(entry), parent=parent)
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -1051,95 +1044,14 @@ class ScanCard(QFrame):
 
 
 # ── SpecCard ──────────────────────────────────────────────────────────────────
-class SpecCard(QFrame):
+class SpecCard(_BrowseCard):
     """Thumbnail card for a .VERT spectroscopy file."""
-    clicked        = Signal(object, bool)
-    double_clicked = Signal(object)
-
-    CARD_W = 200
-    CARD_H = 220
-    IMG_W  = 180
-    IMG_H  = 150
 
     def __init__(self, entry: VertFile, t: dict, parent=None):
-        super().__init__(parent)
-        self.entry = entry
-        self._t    = t
-        self._sel  = False
-
-        self.setFixedSize(self.CARD_W, self.CARD_H)
-        self.setCursor(QCursor(Qt.PointingHandCursor))
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(8, 8, 8, 6)
-        lay.setSpacing(3)
-
-        self.img_lbl = QLabel()
-        self.img_lbl.setFixedSize(self.IMG_W, self.IMG_H)
-        self.img_lbl.setAlignment(Qt.AlignCenter)
-        self.img_lbl.setText("…")
-
-        lbl_text = entry.stem if len(entry.stem) <= 22 else entry.stem[:20] + ".."
-        self.name_lbl = QLabel(lbl_text)
-        self.name_lbl.setAlignment(Qt.AlignCenter)
-        self.name_lbl.setFont(QFont("Helvetica", 10))
-
         sweep = entry.sweep_type.replace("_", " ") if entry.sweep_type != "unknown" else "VERT"
         pts   = f"{entry.n_points} pts" if entry.n_points else ""
         meta  = "  |  ".join(filter(None, [sweep, pts]))
-        self.meta_lbl = QLabel(meta)
-        self.meta_lbl.setAlignment(Qt.AlignCenter)
-        self.meta_lbl.setFont(QFont("Helvetica", 9))
-
-        lay.addWidget(self.img_lbl)
-        lay.addWidget(self.name_lbl)
-        lay.addWidget(self.meta_lbl)
-        self._refresh_style()
-
-    def set_pixmap(self, pixmap: QPixmap):
-        self.img_lbl.setPixmap(
-            pixmap.scaled(self.IMG_W, self.IMG_H,
-                          Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        self.img_lbl.setText("")
-
-    def set_selected(self, val: bool):
-        self._sel = val
-        self._refresh_style()
-
-    def apply_theme(self, t: dict):
-        self._t = t
-        self._refresh_style()
-
-    def _refresh_style(self):
-        t = self._t
-        if self._sel:
-            bg, border, bw, fg = t["card_sel"], t["accent_bg"], 3, t["accent_bg"]
-        else:
-            bg, border, bw, fg = t["card_bg"], t["sep"], 1, t["card_fg"]
-        self.setStyleSheet(f"""
-            SpecCard {{
-                background-color: {bg};
-                border: {bw}px solid {border};
-                border-radius: 6px;
-            }}
-            SpecCard:hover {{
-                border: {bw}px solid {t["accent_bg"]};
-            }}
-        """)
-        self.name_lbl.setStyleSheet(f"color: {fg}; background: transparent;")
-        self.meta_lbl.setStyleSheet(f"color: {t['sub_fg']}; background: transparent;")
-        self.img_lbl.setStyleSheet(f"color: {t['sub_fg']}; background: transparent;")
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            ctrl = bool(event.modifiers() & Qt.ControlModifier)
-            self.clicked.emit(self.entry, ctrl)
-        super().mousePressEvent(event)
-
-    def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.double_clicked.emit(self.entry)
-        super().mouseDoubleClickEvent(event)
+        super().__init__(entry, t, meta, parent=parent)
 
 
 # ── ThumbnailGrid ─────────────────────────────────────────────────────────────
