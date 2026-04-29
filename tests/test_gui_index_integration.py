@@ -27,6 +27,7 @@ from probeflow.gui import (
     GUI_FONT_DEFAULT,
     GUI_FONT_SIZES,
     load_config,
+    Navbar,
     normalise_gui_font_size,
     render_scan_thumbnail,
     render_with_processing,
@@ -377,19 +378,22 @@ class TestBrowseLayoutCleanup:
         panel.close()
         panel.deleteLater()
 
-    def test_browse_info_font_selector_defaults_and_emits(self, qapp):
-        panel = BrowseInfoPanel(THEMES["dark"], {})
+    def test_navbar_font_size_menu_defaults_and_emits(self, qapp):
+        navbar = Navbar(True, "bogus")
         seen = []
-        panel.font_size_changed.connect(seen.append)
+        navbar.font_size_changed.connect(seen.append)
 
-        assert panel.font_size_cb.currentText() == "Medium"
+        assert navbar._font_size_btn.text() == "Text: Medium"
+        assert navbar._font_size_actions["Medium"].isChecked()
 
-        panel.font_size_cb.setCurrentText("Large")
+        navbar.set_font_size("Large")
 
         assert seen == ["Large"]
+        assert navbar._font_size_btn.text() == "Text: Large"
+        assert navbar._font_size_actions["Large"].isChecked()
 
-        panel.close()
-        panel.deleteLater()
+        navbar.close()
+        navbar.deleteLater()
 
     def test_browse_info_panel_keeps_key_values_and_channel_slots(self, qapp, monkeypatch):
         import probeflow.gui as gui_mod
@@ -426,6 +430,10 @@ class TestBrowseLayoutCleanup:
             "Current forward",
         ]
         assert panel.name_lbl.sizePolicy().verticalPolicy().name == "Maximum"
+        assert not hasattr(panel, "font_size_cb")
+        assert panel._meta_widget.isVisible() is False
+        assert panel.layout().stretch(panel.layout().indexOf(panel._meta_widget)) == 0
+        assert panel.layout().stretch(panel.layout().indexOf(panel._bottom_spacer)) == 1
 
         panel.close()
         panel.deleteLater()
@@ -446,6 +454,12 @@ class TestBrowseLayoutCleanup:
         assert panel.meta_table.horizontalHeader().sectionResizeMode(0) == QHeaderView.Interactive
         assert panel.meta_table.horizontalHeader().sectionResizeMode(1) == QHeaderView.Stretch
         assert panel.meta_table.rowHeight(0) >= panel.meta_table.verticalHeader().defaultSectionSize()
+
+        panel._toggle_meta()
+
+        assert panel._meta_widget.isHidden() is False
+        assert panel.layout().stretch(panel.layout().indexOf(panel._meta_widget)) == 1
+        assert panel.layout().stretch(panel.layout().indexOf(panel._bottom_spacer)) == 0
 
         panel.close()
         panel.deleteLater()

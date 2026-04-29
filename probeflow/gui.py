@@ -3915,12 +3915,10 @@ class BrowseToolPanel(QWidget):
 # ── Browse info panel (RIGHT) ─────────────────────────────────────────────────
 class BrowseInfoPanel(QWidget):
     """Right-side info panel: selected file name, channel thumbnails, metadata."""
-    font_size_changed = Signal(str)
 
     def __init__(self, t: dict, cfg: dict, parent=None):
         super().__init__(parent)
         self._t         = t
-        self._font_size_label = normalise_gui_font_size(cfg.get("gui_font_size"))
         self._pool      = QThreadPool.globalInstance()
         self._ch_token  = object()
         self._meta_rows: list[tuple[str, str]] = []
@@ -3930,33 +3928,30 @@ class BrowseInfoPanel(QWidget):
 
     def _build(self):
         lay = QVBoxLayout(self)
+        self._main_lay = lay
         lay.setContentsMargins(10, 6, 10, 6)
         lay.setSpacing(3)
 
-        font_row = QHBoxLayout()
-        font_row.setContentsMargins(0, 0, 0, 0)
-        font_lbl = QLabel("Text size")
-        font_lbl.setFont(QFont("Helvetica", 8))
-        self.font_size_cb = QComboBox()
-        self.font_size_cb.addItems(list(GUI_FONT_SIZES))
-        self.font_size_cb.setCurrentText(self._font_size_label)
-        self.font_size_cb.setFont(QFont("Helvetica", 9))
-        self.font_size_cb.currentTextChanged.connect(self._on_font_size_changed)
-        font_row.addWidget(font_lbl)
-        font_row.addWidget(self.font_size_cb, 1)
-        lay.addLayout(font_row)
+        summary = QWidget()
+        summary.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        summary_lay = QVBoxLayout(summary)
+        summary_lay.setContentsMargins(0, 0, 0, 0)
+        summary_lay.setSpacing(3)
 
         self.name_lbl = QLabel("No scan selected")
         self.name_lbl.setFont(QFont("Helvetica", 10, QFont.Bold))
         self.name_lbl.setWordWrap(True)
         self.name_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
-        lay.addWidget(self.name_lbl)
+        summary_lay.addWidget(self.name_lbl)
 
         # Compact key scan summary. Keep this tight so channels sit high.
+        qi_widget = QWidget()
+        qi_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         qi_grid = QGridLayout()
         qi_grid.setHorizontalSpacing(8)
         qi_grid.setVerticalSpacing(2)
         qi_grid.setContentsMargins(0, 0, 0, 0)
+        qi_widget.setLayout(qi_grid)
         self._qi: dict[str, QLabel] = {}
         _QI_ROWS = [("Pixels", "pixels"), ("Size", "size"),
                     ("Bias",   "bias"),   ("Setp.", "setp")]
@@ -3969,22 +3964,25 @@ class BrowseInfoPanel(QWidget):
             qi_grid.addWidget(t_lbl, r, c * 2)
             qi_grid.addWidget(v_lbl, r, c * 2 + 1)
             self._qi[key] = v_lbl
-        lay.addLayout(qi_grid)
-        lay.addWidget(_sep())
+        summary_lay.addWidget(qi_widget)
+        summary_lay.addWidget(_sep())
 
         ch_hdr = QLabel("Channels")
         ch_hdr.setFont(QFont("Helvetica", 11, QFont.Bold))
-        lay.addWidget(ch_hdr)
+        summary_lay.addWidget(ch_hdr)
 
+        self._ch_widget = QWidget()
+        self._ch_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         self._ch_grid = QGridLayout()
         self._ch_grid.setSpacing(8)
         self._ch_grid.setContentsMargins(0, 0, 0, 0)
+        self._ch_widget.setLayout(self._ch_grid)
         self._ch_cells: list[QWidget] = []
         self._ch_img_lbls:  list[QLabel] = []
         self._ch_name_lbls: list[QLabel] = []
         self._set_channel_preview_slots(PLANE_NAMES)
-        lay.addLayout(self._ch_grid)
-        lay.addWidget(_sep())
+        summary_lay.addWidget(self._ch_widget)
+        summary_lay.addWidget(_sep())
 
         # Full metadata is hidden behind a toggle. The quick-info grid above
         # (Pixels / Size / Bias / Setpoint) is what users want at a glance;
@@ -3997,7 +3995,8 @@ class BrowseInfoPanel(QWidget):
             "Expand to show the full scan header (also accessible via "
             "right-click → Show full metadata).")
         self._meta_toggle.clicked.connect(self._toggle_meta)
-        lay.addWidget(self._meta_toggle)
+        summary_lay.addWidget(self._meta_toggle)
+        lay.addWidget(summary)
 
         self._meta_widget = QWidget()
         meta_lay = QVBoxLayout(self._meta_widget)
@@ -4026,18 +4025,19 @@ class BrowseInfoPanel(QWidget):
         self.meta_table.setShowGrid(False)
         meta_lay.addWidget(self.meta_table, 1)
         self._meta_widget.setVisible(False)
-        lay.addWidget(self._meta_widget, 1)
-
-    def _on_font_size_changed(self, label: str):
-        label = normalise_gui_font_size(label)
-        self._font_size_label = label
-        self.font_size_changed.emit(label)
+        lay.addWidget(self._meta_widget, 0)
+        self._bottom_spacer = QWidget()
+        self._bottom_spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        lay.addWidget(self._bottom_spacer, 1)
 
     def _toggle_meta(self):
         vis = not self._meta_widget.isVisible()
         self._meta_widget.setVisible(vis)
         self._meta_toggle.setText(
             "[-] Hide all metadata" if vis else "[+] Show all metadata")
+        self._main_lay.setStretchFactor(self._meta_widget, 1 if vis else 0)
+        self._main_lay.setStretchFactor(self._bottom_spacer, 0 if vis else 1)
+        self._bottom_spacer.setVisible(not vis)
         if vis:
             self.meta_table.resizeRowsToContents()
 
@@ -4895,12 +4895,14 @@ class AboutDialog(QDialog):
 # ── Navbar ────────────────────────────────────────────────────────────────────
 class Navbar(QWidget):
     theme_toggle_clicked = Signal()
+    font_size_changed    = Signal(str)
     about_clicked        = Signal()
 
-    def __init__(self, dark: bool, parent=None):
+    def __init__(self, dark: bool, font_size_label: str = GUI_FONT_DEFAULT, parent=None):
         super().__init__(parent)
-        self._dark    = dark
-        self._btns:   list[QPushButton] = []
+        self._dark            = dark
+        self._font_size_label = normalise_gui_font_size(font_size_label)
+        self._btns:           list[QPushButton] = []
         self.setFixedHeight(NAVBAR_H)
 
         lay = QHBoxLayout(self)
@@ -4933,6 +4935,20 @@ class Navbar(QWidget):
             "Light mode" if dark else "Dark mode",
             self.theme_toggle_clicked.emit,
         )
+        self._font_size_btn = _nbtn(
+            f"Text: {self._font_size_label}",
+            lambda: None,
+        )
+        font_menu = QMenu(self._font_size_btn)
+        self._font_size_actions: dict[str, QAction] = {}
+        for label in GUI_FONT_SIZES:
+            action = QAction(label, font_menu)
+            action.setCheckable(True)
+            action.triggered.connect(lambda _checked=False, value=label: self.set_font_size(value))
+            font_menu.addAction(action)
+            self._font_size_actions[label] = action
+        self._font_size_btn.setMenu(font_menu)
+        self._sync_font_size_button()
         _nbtn("GitHub", lambda: _open_url(GITHUB_URL))
         _nbtn("About",  self.about_clicked.emit)
 
@@ -4942,6 +4958,20 @@ class Navbar(QWidget):
         self._dark = dark
         self._theme_btn.setText("Light mode" if dark else "Dark mode")
         self._apply_nav_theme()
+
+    def set_font_size(self, label: str):
+        label = normalise_gui_font_size(label)
+        if label == self._font_size_label:
+            self._sync_font_size_button()
+            return
+        self._font_size_label = label
+        self._sync_font_size_button()
+        self.font_size_changed.emit(label)
+
+    def _sync_font_size_button(self):
+        self._font_size_btn.setText(f"Text: {self._font_size_label}")
+        for label, action in self._font_size_actions.items():
+            action.setChecked(label == self._font_size_label)
 
     def _apply_nav_theme(self):
         if self._dark:
@@ -5014,8 +5044,9 @@ class ProbeFlowWindow(QMainWindow):
         v_lay.setContentsMargins(0, 0, 0, 0)
         v_lay.setSpacing(0)
 
-        self._navbar = Navbar(self._dark)
+        self._navbar = Navbar(self._dark, self._gui_font_size)
         self._navbar.theme_toggle_clicked.connect(self._toggle_theme)
+        self._navbar.font_size_changed.connect(self._on_gui_font_size_changed)
         self._navbar.about_clicked.connect(self._show_about)
         v_lay.addWidget(self._navbar)
 
@@ -5097,7 +5128,6 @@ class ProbeFlowWindow(QMainWindow):
         self._browse_tools.map_spectra_requested.connect(self._on_map_spectra)
         self._browse_tools.filter_changed.connect(self._on_filter_changed)
         self._browse_tools.thumbnail_channel_changed.connect(self._on_thumbnail_channel_changed)
-        self._browse_info.font_size_changed.connect(self._on_gui_font_size_changed)
         # Sync initial filter state from the toolbar into the grid so the
         # two agree even before the first folder is opened.
         self._grid.apply_filter(self._browse_tools.get_filter_mode())
