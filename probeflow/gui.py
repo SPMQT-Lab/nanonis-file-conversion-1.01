@@ -2790,7 +2790,14 @@ class SpecViewerDialog(QDialog):
 
     def _channel_display_label(self, ch: str) -> str:
         _values, disp_unit = self._display_values_for_channel(ch)
-        return f"{ch}  ({disp_unit})" if disp_unit else ch
+        label = self._channel_label(ch)
+        return f"{label}  ({disp_unit})" if disp_unit else label
+
+    def _channel_label(self, ch: str) -> str:
+        if self._spec is None:
+            return ch
+        info = getattr(self._spec, "channel_info", {}).get(ch)
+        return getattr(info, "display_label", ch) if info is not None else ch
 
     def _refresh_channel_labels(self) -> None:
         for ch, cb in self._checkboxes.items():
@@ -2830,7 +2837,8 @@ class SpecViewerDialog(QDialog):
             ax.set_facecolor(self._BG)
             ax.plot(spec.x_array, y_disp, linewidth=1.0,
                     color=self._COLORS[i % len(self._COLORS)])
-            ax.set_ylabel(f"{ch} ({disp_unit})" if disp_unit else ch,
+            label = self._channel_label(ch)
+            ax.set_ylabel(f"{label} ({disp_unit})" if disp_unit else label,
                           color=self._FG, fontsize=8)
             ax.tick_params(colors=self._FG, labelsize=7)
             for spine in ax.spines.values():
@@ -2861,7 +2869,7 @@ class SpecViewerDialog(QDialog):
             if not cb.isChecked() or ch not in spec.channels:
                 continue
             y_disp, disp_unit = self._display_values_for_channel(ch)
-            yield ch, y_disp, disp_unit
+            yield ch, self._channel_label(ch), y_disp, disp_unit
 
     def _export_csv(self) -> None:
         if self._spec is None:
@@ -2883,10 +2891,11 @@ class SpecViewerDialog(QDialog):
             with open(out_path, "w", newline="", encoding="utf-8") as fh:
                 w = csv.writer(fh)
                 w.writerow([self._spec.x_label]
-                           + [f"{ch} ({u})" if u else ch for ch, _, u in rows])
+                           + [f"{label} ({u})" if u else label
+                              for _ch, label, _y, u in rows])
                 for i in range(len(x)):
                     w.writerow([f"{x[i]:.10g}"]
-                               + [f"{y[i]:.10g}" for _, y, _ in rows])
+                               + [f"{y[i]:.10g}" for _ch, _label, y, _u in rows])
             self._status.setText(f"CSV → {out_path}")
         except Exception as exc:
             self._status.setText(f"CSV export error: {exc}")
@@ -2911,14 +2920,14 @@ class SpecViewerDialog(QDialog):
             return
         # Group all channels under one Y axis label if they share a unit;
         # otherwise we keep the legend per-channel and a generic "value" label.
-        units = {u for _, _, u in rows}
+        units = {u for _, _label, _y, u in rows}
         if len(units) == 1:
-            y_label = f"value ({rows[0][2]})" if rows[0][2] else "value"
+            y_label = f"value ({rows[0][3]})" if rows[0][3] else "value"
         else:
             y_label = "value"
         curves = [
-            Curve(name=ch, y=y, legend=f"{ch} ({u})" if u else ch)
-            for ch, y, u in rows
+            Curve(name=ch, y=y, legend=f"{label} ({u})" if u else label)
+            for ch, label, y, u in rows
         ]
         try:
             paths = export_bundle(
@@ -2976,18 +2985,18 @@ class SpecViewerDialog(QDialog):
 
         table = QTableWidget(n_rows, n_cols)
         display_rows = [
-            (ch, *self._display_values_for_channel(ch))
+            (ch, self._channel_label(ch), *self._display_values_for_channel(ch))
             for ch in order
         ]
         headers = [spec.x_label] + [
-            f"{ch} ({unit})" if unit else ch
-            for ch, _values, unit in display_rows
+            f"{label} ({unit})" if unit else label
+            for _ch, label, _values, unit in display_rows
         ]
         table.setHorizontalHeaderLabels(headers)
 
         for r in range(n_rows):
             table.setItem(r, 0, QTableWidgetItem(f"{spec.x_array[r]:.6g}"))
-            for c, (_ch, values, _unit) in enumerate(display_rows, start=1):
+            for c, (_ch, _label, values, _unit) in enumerate(display_rows, start=1):
                 table.setItem(r, c, QTableWidgetItem(f"{values[r]:.6g}"))
         table.horizontalHeader().setStretchLastSection(True)
         return table

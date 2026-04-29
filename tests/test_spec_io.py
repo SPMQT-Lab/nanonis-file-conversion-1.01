@@ -660,6 +660,11 @@ class TestChannelMetadata:
         assert set(spec.channels) == {"I", "Z", "V", "dI/dV", "ADC0"}
         assert spec.y_units["dI/dV"] == "unknown"
         assert spec.y_units["ADC0"] == "unknown"
+        assert set(spec.channel_info) == set(spec.channel_order)
+        assert spec.channel_info["dI/dV"].source_name == "dI/dV"
+        assert "lockin_derivative" in spec.channel_info["dI/dV"].roles
+        assert spec.metadata["source_channels"] == ["V", "Z", "I", "dI/dV", "ADC0"]
+        assert spec.metadata["channel_roles"]["ADC0"] == ["auxiliary"]
         np.testing.assert_allclose(spec.channels["dI/dV"], [1.25, 1.50])
         np.testing.assert_allclose(spec.channels["ADC0"], [2.5, 3.5])
         assert "source" in spec.metadata
@@ -681,6 +686,9 @@ class TestChannelMetadata:
         meta = read_spec_metadata(f)
         assert meta.channels == tuple(spec.channel_order)
         assert meta.units == tuple(spec.y_units[ch] for ch in spec.channel_order)
+        assert tuple(ch.key for ch in meta.channel_info) == tuple(spec.channel_order)
+        assert meta.metadata["source_channels"] == spec.metadata["source_channels"]
+        assert meta.metadata["channel_roles"] == spec.metadata["channel_roles"]
         assert meta.metadata["n_points"] == spec.metadata["n_points"]
         assert meta.metadata["source"]["sha256"] == spec.metadata["source"]["sha256"]
 
@@ -751,10 +759,32 @@ class TestMeasurementInterpretation:
         assert "Z" not in spec.channels
         assert spec.y_units["Z feedback"] == "DAC"
         assert spec.y_units["Z command"] == "m"
+        assert spec.channel_info["Z feedback"].source_name == "Raw column 9"
+        assert spec.channel_info["Z feedback"].display_label == "Raw column 9 - Z feedback"
+        assert "z_feedback" in spec.channel_info["Z feedback"].roles
+        assert spec.channel_info["Z command"].source_name == "Z"
+        assert spec.channel_info["Z command"].display_label == "Z - command"
+        assert "z_command" in spec.channel_info["Z command"].roles
+        assert spec.metadata["channel_roles"]["Z feedback"] == [
+            "z_feedback",
+            "height_counts",
+        ]
+        assert spec.metadata["source_channels"] == [
+            "V",
+            "Z",
+            "X",
+            "I",
+            "dI/dV",
+            "ADC0",
+            "NA02",
+            "di_q",
+            "Raw column 9",
+        ]
         assert np.ptp(spec.channels["Z feedback"]) > 0
         assert np.allclose(spec.channels["Z command"], 0.0)
         assert meta.channels == tuple(spec.channel_order)
         assert meta.units == tuple(spec.y_units[ch] for ch in spec.channel_order)
+        assert {ch.key: ch.source_name for ch in meta.channel_info}["Z feedback"] == "Raw column 9"
 
     def test_measurement_mode_override_takes_precedence(self, tmp_path):
         f = _write_createc_vert(
@@ -804,3 +834,6 @@ class TestMeasurementInterpretation:
         assert out["measurement_family"] == "sts"
         assert "feedback_mode" in out
         assert "measurement_evidence" in out
+        assert "channel_info" in out
+        assert out["channel_info"][0]["key"] == out["channels"][0]
+        assert "source_name" in out["channel_info"][0]

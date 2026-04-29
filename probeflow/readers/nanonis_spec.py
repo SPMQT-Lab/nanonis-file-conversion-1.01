@@ -21,7 +21,13 @@ from typing import Optional, Union
 import numpy as np
 
 from probeflow.source_identity import build_source_identity
-from probeflow.spec_io import SpecData, SpecMetadata
+from probeflow.spec_io import (
+    SpecChannel,
+    SpecData,
+    SpecMetadata,
+    _add_channel_metadata_overlay,
+    infer_spec_channel_roles,
+)
 
 log = logging.getLogger(__name__)
 
@@ -123,15 +129,17 @@ def read_nanonis_spec(path: Union[str, Path]) -> SpecData:
     # Build channels dict keyed by channel NAME (without the (unit) suffix).
     channels: dict[str, np.ndarray] = {}
     y_units: dict[str, str] = {}
+    channel_info: dict[str, SpecChannel] = {}
     channel_order: list[str] = []
-    for i, (_raw, name, unit) in enumerate(columns):
-        # Column names may collide in rare Nanonis exports; last one wins and
-        # we log a warning rather than silently losing data.
+    for i, (raw, name, unit) in enumerate(columns):
+        # Column names may collide in rare Nanonis exports; keep the first and
+        # log a warning rather than silently overwriting data.
         if name in channels:
             log.warning("%s: duplicate channel name %r — keeping first", path.name, name)
             continue
         channels[name] = arr[:, i]
         y_units[name] = unit
+        channel_info[name] = _spec_channel_from_column(raw, name, unit)
         channel_order.append(name)
 
     # Pick X axis: prefer a "Bias calc" column for bias sweeps, else "Bias",
@@ -203,6 +211,12 @@ def read_nanonis_spec(path: Union[str, Path]) -> SpecData:
             data_offset=_data_offset_bytes(path),
         ),
     }
+    _add_channel_metadata_overlay(
+        metadata,
+        channel_info,
+        channel_order,
+        [channel_info[name].source_name for name in channel_order],
+    )
 
     log.info(
         "%s: %s, %d pts, %d channels, pos=(%.3g, %.3g) m",
@@ -221,6 +235,7 @@ def read_nanonis_spec(path: Union[str, Path]) -> SpecData:
         metadata=metadata,
         channel_order=channel_order,
         default_channels=default_channels,
+        channel_info=channel_info,
     )
 
 
@@ -234,8 +249,10 @@ def read_nanonis_spec_metadata(path: Union[str, Path]) -> SpecMetadata:
     experiment = hdr.get("Experiment", "").strip().lower()
     sweep_type = _SWEEP_TYPE_MAP.get(experiment, experiment.replace(" ", "_") or "unknown")
 
-    channel_names = tuple(name for _raw, name, _unit in columns)
-    units = tuple(unit for _raw, _name, unit in columns)
+    channel_info = _channel_info_from_columns(columns)
+    channel_order = list(channel_info)
+    channel_names = tuple(channel_order)
+    units = tuple(channel_info[name].unit for name in channel_order)
     pos_x_m = _parse_header_float(hdr, "X (m)")
     pos_y_m = _parse_header_float(hdr, "Y (m)")
     bias = _parse_optional_header_float(hdr, "Bias>Bias (V)")
@@ -258,6 +275,12 @@ def read_nanonis_spec_metadata(path: Union[str, Path]) -> SpecMetadata:
             data_offset=_data_offset_bytes(path),
         ),
     }
+    _add_channel_metadata_overlay(
+        metadata,
+        channel_info,
+        channel_order,
+        [channel_info[name].source_name for name in channel_order],
+    )
     return SpecMetadata(
         path=path,
         source_format="nanonis_dat_spectrum",
@@ -269,6 +292,29 @@ def read_nanonis_spec_metadata(path: Union[str, Path]) -> SpecMetadata:
         comment=comment,
         acquisition_datetime=acquisition_datetime,
         raw_header=hdr,
+        channel_info=tuple(channel_info[name] for name in channel_order),
+    )
+
+
+def _channel_info_from_columns(
+    columns: list[tuple[str, str, str]],
+) -> dict[str, SpecChannel]:
+    channel_info: dict[str, SpecChannel] = {}
+    for raw, name, unit in columns:
+        if name in channel_info:
+            continue
+        channel_info[name] = _spec_channel_from_column(raw, name, unit)
+    return channel_info
+
+
+def _spec_channel_from_column(raw: str, name: str, unit: str) -> SpecChannel:
+    return SpecChannel(
+        key=name,
+        source_name=name,
+        source_label=raw,
+        unit=unit,
+        roles=infer_spec_channel_roles(name),
+        display_label=name,
     )
 
 

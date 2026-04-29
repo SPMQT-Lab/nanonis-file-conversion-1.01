@@ -1076,7 +1076,7 @@ class TestBrowseLayoutCleanup:
 class TestSpecViewerRawData:
     def test_raw_data_table_shows_all_rows_with_display_units(self, qapp, monkeypatch):
         from probeflow.gui import SpecViewerDialog, THEMES
-        from probeflow.spec_io import SpecData
+        from probeflow.spec_io import SpecChannel, SpecData
 
         monkeypatch.setattr(SpecViewerDialog, "_load", lambda self: None)
         entry = VertFile(path=TESTDATA / "spectrum_time_trace_5k.VERT", stem="spec")
@@ -1097,14 +1097,41 @@ class TestSpecViewerRawData:
             metadata={"n_points": 25, "sweep_type": "time_trace"},
             channel_order=["I", "Z", "V"],
             default_channels=["I"],
+            channel_info={
+                "I": SpecChannel(
+                    key="I",
+                    source_name="I",
+                    source_label="I",
+                    unit="A",
+                    roles=("current",),
+                    display_label="Current channel",
+                ),
+                "Z": SpecChannel(
+                    key="Z",
+                    source_name="Raw column 9",
+                    source_label="Raw column 9",
+                    unit="m",
+                    roles=("z_feedback",),
+                    display_label="Raw column 9 - Z feedback",
+                ),
+                "V": SpecChannel(
+                    key="V",
+                    source_name="V",
+                    source_label="V",
+                    unit="V",
+                    roles=("bias_axis",),
+                    display_label="Bias",
+                ),
+            },
         )
 
         table = dlg._raw_data_table()
 
         assert table.rowCount() == 25
-        assert table.horizontalHeaderItem(1).text() == "I (pA)"
-        assert table.horizontalHeaderItem(2).text() == "Z (nm)"
-        assert table.horizontalHeaderItem(3).text() == "V (mV)"
+        assert table.horizontalHeaderItem(1).text() == "Current channel (pA)"
+        assert table.horizontalHeaderItem(2).text() == "Raw column 9 - Z feedback (nm)"
+        assert table.horizontalHeaderItem(3).text() == "Bias (mV)"
+        assert dlg._channel_display_label("Z") == "Raw column 9 - Z feedback  (nm)"
         assert table.item(24, 1).text() == "-250"
         assert table.item(24, 2).text() == "0"
         assert table.item(24, 3).text() == "-300"

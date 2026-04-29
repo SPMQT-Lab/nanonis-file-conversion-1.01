@@ -54,6 +54,24 @@ class TestChannels:
         assert "Current [AVG]" in sts_spec.channels
         assert "LockIn [AVG]" in sts_spec.channels
 
+    def test_channel_info_preserves_source_labels_and_roles(self, sts_spec):
+        assert set(sts_spec.channel_info) == set(sts_spec.channel_order)
+        bias = sts_spec.channel_info["Bias calc"]
+        current = sts_spec.channel_info["Current [AVG]"]
+        lockin = sts_spec.channel_info["LockIn [AVG]"]
+
+        assert bias.source_name == "Bias calc"
+        assert bias.source_label.startswith("Bias calc")
+        assert bias.unit == sts_spec.y_units["Bias calc"]
+        assert "bias_axis" in bias.roles
+        assert current.source_label.startswith("Current [AVG]")
+        assert "current" in current.roles
+        assert "lockin_derivative" in lockin.roles
+        assert sts_spec.metadata["channel_roles"]["LockIn [AVG]"] == [
+            "lockin_derivative"
+        ]
+        assert "Bias calc" in sts_spec.metadata["source_channels"]
+
 
 class TestXAxis:
     def test_kelvin_x_is_bias_v(self, kelvin_spec):
@@ -123,6 +141,11 @@ class TestDispatcher:
         assert meta.metadata["sweep_type"] == sts_spec.metadata["sweep_type"]
         assert meta.metadata["n_points"] == sts_spec.metadata["n_points"]
         assert meta.channels == tuple(sts_spec.channel_order)
+        assert tuple(ch.key for ch in meta.channel_info) == tuple(sts_spec.channel_order)
+        assert {
+            ch.key: ch.source_label
+            for ch in meta.channel_info
+        }["Current [AVG]"].startswith("Current [AVG]")
 
     def test_read_spec_metadata_has_position_and_bias(self):
         meta = read_spec_metadata(STS)

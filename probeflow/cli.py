@@ -1023,7 +1023,7 @@ def _cmd_dat2png(args) -> int:
 
 def _cmd_spec_info(args) -> int:
     setup_logging(args.verbose)
-    from probeflow.spec_io import read_spec_file
+    from probeflow.spec_io import read_spec_file, spec_channel_to_dict
     spec = read_spec_file(args.input)
     channels = list(spec.channel_order) if spec.channel_order else list(spec.channels.keys())
     if args.json:
@@ -1038,6 +1038,11 @@ def _cmd_spec_info(args) -> int:
             "measurement_evidence": spec.metadata.get("measurement_evidence"),
             "n_points": spec.metadata["n_points"],
             "channels": channels,
+            "channel_info": [
+                spec_channel_to_dict(spec.channel_info[ch])
+                for ch in channels
+                if ch in spec.channel_info
+            ],
             "x_label": spec.x_label,
             "x_unit": spec.x_unit,
             "position_m": list(spec.position),

@@ -192,7 +192,7 @@ def _item_from_spec(
     mtime_ns: Optional[int],
     size_bytes: Optional[int],
 ) -> ProbeFlowItem:
-    from probeflow.spec_io import read_spec_metadata
+    from probeflow.spec_io import read_spec_metadata, spec_channel_to_dict
     meta = read_spec_metadata(path)
     n_pts = meta.metadata.get("n_points")
     extra: dict[str, Any] = {
@@ -205,6 +205,12 @@ def _item_from_spec(
         "z_command_channel": meta.metadata.get("z_command_channel"),
         "measurement_confidence": meta.metadata.get("measurement_confidence"),
         "measurement_evidence": meta.metadata.get("measurement_evidence"),
+        "channel_info": [
+            spec_channel_to_dict(channel)
+            for channel in meta.channel_info
+        ],
+        "channel_roles": meta.metadata.get("channel_roles"),
+        "source_channels": meta.metadata.get("source_channels"),
         "n_points": n_pts,
         "position_m": meta.position,
         "spec_freq_hz": _f(meta.metadata.get("spec_freq_hz")),

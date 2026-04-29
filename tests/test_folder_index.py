@@ -234,6 +234,15 @@ class TestProbeFlowItemContract:
         assert item.metadata["height_channel"] == "Z feedback"
         assert "Z feedback" in item.channels
         assert "Raw column 9" not in item.channels
+        assert item.metadata["channel_roles"]["Z feedback"] == [
+            "z_feedback",
+            "height_counts",
+        ]
+        assert any(
+            ch["source_name"] == "Raw column 9"
+            and ch["key"] == "Z feedback"
+            for ch in item.metadata["channel_info"]
+        )
 
     def test_spectrum_indexing_does_not_call_full_reader(self, tmp_path, monkeypatch):
         shutil.copy(_CREATEC_VERT, tmp_path / _CREATEC_VERT.name)

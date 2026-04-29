@@ -28,6 +28,27 @@ log = logging.getLogger(__name__)
 _TIME_TRACE_THRESHOLD_MV = 1.0
 
 
+@dataclass(frozen=True)
+class SpecChannel:
+    """Source-aware metadata for one spectroscopy channel.
+
+    ``key`` is the backwards-compatible lookup key in ``SpecData.channels``.
+    ``source_name`` and ``source_label`` preserve the vendor/file identity so
+    interpretations can live alongside the decoded data instead of replacing it.
+    """
+
+    key: str
+    source_name: str
+    source_label: str
+    unit: str
+    roles: tuple[str, ...] = ()
+    display_label: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.display_label:
+            object.__setattr__(self, "display_label", self.key)
+
+
 @dataclass
 class SpecData:
     """All data and metadata from one Createc .VERT spectroscopy file.
@@ -56,6 +77,8 @@ class SpecData:
         (x_m, y_m) tip position in physical coordinates (metres).
     metadata : dict[str, Any]
         Scan parameters: sweep_type, bias, frequency, title, etc.
+    channel_info : dict[str, SpecChannel]
+        Source-aware channel metadata keyed like ``channels``.
     """
 
     header: dict[str, str]
@@ -71,6 +94,7 @@ class SpecData:
     channel_order: list[str] = field(default_factory=list)
     # Subset of ``channel_order`` to preselect when a viewer first opens.
     default_channels: list[str] = field(default_factory=list)
+    channel_info: dict[str, SpecChannel] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         n = self.metadata.get("n_points", "?")
@@ -98,6 +122,7 @@ class SpecMetadata:
     comment: str | None = None
     acquisition_datetime: str | None = None
     raw_header: dict[str, str] = field(default_factory=dict)
+    channel_info: tuple[SpecChannel, ...] = field(default_factory=tuple)
 
 
 def parse_spec_header(path: Union[str, Path]) -> dict[str, str]:
@@ -175,10 +200,12 @@ def _read_createc_vert_metadata(
 ) -> SpecMetadata:
     """Read Createc .VERT metadata without materialising channel arrays."""
     report = read_createc_vert_report(path, include_arrays=False)
-    metadata, bias, comment, position, order, units = _metadata_from_vert_report(
-        report,
-        time_trace_threshold_mv=time_trace_threshold_mv,
-        measurement_mode=measurement_mode,
+    metadata, bias, comment, position, order, units, channel_info = (
+        _metadata_from_vert_report(
+            report,
+            time_trace_threshold_mv=time_trace_threshold_mv,
+            measurement_mode=measurement_mode,
+        )
     )
     return SpecMetadata(
         path=path,
@@ -191,6 +218,7 @@ def _read_createc_vert_metadata(
         comment=comment,
         acquisition_datetime=None,
         raw_header=report.header,
+        channel_info=tuple(channel_info[ch] for ch in order),
     )
 
 
@@ -206,6 +234,7 @@ def _metadata_from_vert_report(
     tuple[float, float],
     list[str],
     dict[str, str],
+    dict[str, SpecChannel],
 ]:
     """Return public metadata fields derived from a Createc VERT report."""
 
@@ -240,6 +269,11 @@ def _metadata_from_vert_report(
     measurement = _with_public_height_aliases(report, measurement)
     order = _public_channel_order(report, measurement)
     units = _public_channel_units(report, measurement, order)
+    channel_info = _public_channel_info(report, measurement, order)
+    source_channels = [
+        info.raw_name
+        for info in report.channel_info
+    ]
 
     metadata: dict[str, Any] = {
         "filename": report.path.name,
@@ -270,6 +304,7 @@ def _metadata_from_vert_report(
         "measurement_confidence": measurement["confidence"],
         "measurement_evidence": list(measurement["evidence"]),
     }
+    _add_channel_metadata_overlay(metadata, channel_info, order, source_channels)
 
     return (
         metadata,
@@ -278,6 +313,7 @@ def _metadata_from_vert_report(
         _position_from_createc_header(hdr),
         order,
         units,
+        channel_info,
     )
 
 
@@ -353,6 +389,27 @@ def _public_channel_units(
     return {name: units[name] for name in order if name in units}
 
 
+def _public_channel_info(
+    report: CreatecVertDecodeReport,
+    measurement: dict[str, Any],
+    order: list[str],
+) -> dict[str, SpecChannel]:
+    channels: dict[str, SpecChannel] = {}
+    for info in report.channel_info:
+        key = _public_channel_name(info.canonical_name, measurement)
+        unit = _public_channel_unit(info.canonical_name, info.unit, measurement)
+        roles = _createc_channel_roles(info.raw_name, key, measurement)
+        channels[key] = SpecChannel(
+            key=key,
+            source_name=info.raw_name,
+            source_label=info.raw_name,
+            unit=unit,
+            roles=roles,
+            display_label=_display_label_for_source(key, info.raw_name, roles),
+        )
+    return {key: channels[key] for key in order if key in channels}
+
+
 def _public_channel_name(name: str, measurement: dict[str, Any]) -> str:
     if _has_feedback_height_alias(measurement):
         if name == "Raw column 9":
@@ -398,6 +455,95 @@ def _with_public_height_aliases(
     return measurement
 
 
+def _createc_channel_roles(
+    source_name: str,
+    key: str,
+    measurement: dict[str, Any],
+) -> tuple[str, ...]:
+    if _has_feedback_height_alias(measurement) and source_name == "Raw column 9":
+        return ("z_feedback", "height_counts")
+    if _has_feedback_height_alias(measurement) and source_name == "Z":
+        return ("z_command",)
+    return infer_spec_channel_roles(source_name)
+
+
+def infer_spec_channel_roles(name: str) -> tuple[str, ...]:
+    """Return conservative spectroscopy roles inferred from a channel name."""
+
+    text = name.strip().lower()
+    if text in {"v", "bias", "bias calc"} or text.startswith("bias "):
+        return ("bias_axis",)
+    if text == "i" or text.startswith("current"):
+        return ("current",)
+    if text in {"z", "z rel", "z-controller"} or text.startswith("z "):
+        return ("z",)
+    if any(
+        token in text
+        for token in ("di/dv", "di/dz", "di_q", "di2_q", "lockin", "li demod")
+    ):
+        return ("lockin_derivative",)
+    if (
+        text.startswith("adc")
+        or text.startswith("dac")
+        or text.startswith("input")
+        or text.startswith("oc ")
+        or text.startswith("na")
+    ):
+        return ("auxiliary",)
+    return ("unknown",)
+
+
+def _display_label_for_source(
+    key: str,
+    source_name: str,
+    roles: tuple[str, ...],
+) -> str:
+    if key == source_name:
+        return key
+    if "z_feedback" in roles:
+        return f"{source_name} - {key}"
+    if "z_command" in roles:
+        return f"{source_name} - command"
+    return f"{source_name} - {key}"
+
+
+def spec_channel_to_dict(channel: SpecChannel) -> dict[str, Any]:
+    """Return a JSON-serialisable representation of ``SpecChannel``."""
+
+    return {
+        "key": channel.key,
+        "source_name": channel.source_name,
+        "source_label": channel.source_label,
+        "unit": channel.unit,
+        "roles": list(channel.roles),
+        "display_label": channel.display_label,
+    }
+
+
+def _add_channel_metadata_overlay(
+    metadata: dict[str, Any],
+    channel_info: dict[str, SpecChannel],
+    order: list[str],
+    source_channels: list[str] | None = None,
+) -> None:
+    ordered = [channel_info[key] for key in order if key in channel_info]
+    metadata["channel_roles"] = {
+        channel.key: list(channel.roles)
+        for channel in ordered
+    }
+    if source_channels is not None:
+        metadata["source_channels"] = list(source_channels)
+    else:
+        metadata["source_channels"] = [
+            channel.source_name
+            for channel in ordered
+        ]
+    metadata["channel_info"] = [
+        spec_channel_to_dict(channel)
+        for channel in ordered
+    ]
+
+
 def _default_spec_channels(channel_order: list[str]) -> list[str]:
     if "I" in channel_order:
         return ["I"]
@@ -430,7 +576,7 @@ def _read_createc_vert(
     if report.raw_columns is None:
         raise ValueError(f"{path.name}: internal VERT report has no numeric arrays")
 
-    metadata, _bias, _comment, position, channel_order, _units = (
+    metadata, _bias, _comment, position, channel_order, _units, channel_info = (
         _metadata_from_vert_report(
             report,
             time_trace_threshold_mv=time_trace_threshold_mv,
@@ -476,6 +622,7 @@ def _read_createc_vert(
         metadata=metadata,
         channel_order=channel_order,
         default_channels=_default_spec_channels(channel_order),
+        channel_info=channel_info,
     )
 
 
