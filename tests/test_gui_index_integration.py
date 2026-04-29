@@ -7,6 +7,7 @@ conversion layer.  They do not require Qt or a running GUI.
 from __future__ import annotations
 
 import os
+import importlib
 from pathlib import Path
 
 import numpy as np
@@ -78,6 +79,26 @@ SAMPLE_ITEMS = [
     _make_item("broken.dat",  item_type="scan",     source_format="createc_dat", load_error="bad zlib"),
     _make_item("unknown.txt", item_type="unknown",  source_format="unknown"),
 ]
+
+
+def test_gui_extracted_modules_import_without_main_window():
+    for module_name in (
+        "probeflow.gui_models",
+        "probeflow.gui_rendering",
+        "probeflow.gui_workers",
+        "probeflow.gui_browse",
+        "probeflow.gui_viewer_widgets",
+    ):
+        importlib.import_module(module_name)
+
+
+def test_gui_compatibility_reexports_remain_available():
+    from probeflow.gui import ImageViewerDialog, SxmFile, ThumbnailGrid, render_scan_image
+
+    assert SxmFile.__name__ == "SxmFile"
+    assert ThumbnailGrid.__name__ == "ThumbnailGrid"
+    assert ImageViewerDialog.__name__ == "ImageViewerDialog"
+    assert callable(render_scan_image)
 
 TESTDATA = Path(__file__).resolve().parents[1] / "anonymised_testdata"
 
@@ -261,6 +282,7 @@ class TestViewerRenderSizing:
     def test_scan_workers_share_render_helper(self, monkeypatch):
         from PIL import Image
         import probeflow.gui as gui_mod
+        import probeflow.gui_workers as worker_mod
 
         calls = []
 
@@ -273,8 +295,8 @@ class TestViewerRenderSizing:
             calls.append(kwargs)
             return Image.new("RGB", (2, 2))
 
-        monkeypatch.setattr(gui_mod, "load_scan", lambda _path: FakeScan())
-        monkeypatch.setattr(gui_mod, "render_scan_image", fake_render)
+        monkeypatch.setattr(worker_mod, "load_scan", lambda _path: FakeScan())
+        monkeypatch.setattr(worker_mod, "render_scan_image", fake_render)
 
         entry = SxmFile(path=Path("scan.dat"), stem="scan")
         gui_mod.ThumbnailLoader(
@@ -507,7 +529,7 @@ class TestThumbnailChannelResolution:
 class TestThumbnailGridChannelSelection:
     @staticmethod
     def _patch_thumbnail_loader(monkeypatch):
-        import probeflow.gui as gui_mod
+        import probeflow.gui_browse as browse_mod
 
         captured = []
 
@@ -532,7 +554,7 @@ class TestThumbnailGridChannelSelection:
             def start(self, _loader):
                 pass
 
-        monkeypatch.setattr(gui_mod, "ThumbnailLoader", FakeThumbnailLoader)
+        monkeypatch.setattr(browse_mod, "ThumbnailLoader", FakeThumbnailLoader)
         return captured, FakePool
 
     def test_load_defaults_to_z_channel_for_scan_cards(self, qapp, monkeypatch):
