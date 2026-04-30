@@ -638,6 +638,7 @@ class ImageViewerDialog(QDialog):
         self._scan_plane_names: list[str] = list(PLANE_NAMES)
         self._scan_plane_units: list[str] = ["m", "m", "A", "A"]
         self._roi_rect_px: Optional[tuple[int, int, int, int]] = None
+        self._selection_geometry: Optional[dict] = None
         self._zero_pick_mode: str = "plane"
         self._zero_plane_points_px: list[tuple[int, int]] = []
         self._pending_initial_plane_idx: Optional[int] = max(0, int(initial_plane_idx))
@@ -712,27 +713,44 @@ class ImageViewerDialog(QDialog):
         self._ch_cb.currentIndexChanged.connect(self._on_channel_changed)
         toolbar.addWidget(self._ch_cb)
 
-        self._auto_clip_btn = QPushButton("Auto")
-        self._auto_clip_btn.setFont(QFont("Helvetica", 8))
-        self._auto_clip_btn.setFixedHeight(24)
-        self._auto_clip_btn.setToolTip(
-            "Autoscale display bounds to the current image's 1%–99% percentiles.")
-        self._auto_clip_btn.clicked.connect(self._on_auto_clip)
-        toolbar.addWidget(self._auto_clip_btn)
-
-        self._hist_export_btn = QPushButton("Export histogram…")
-        self._hist_export_btn.setFont(QFont("Helvetica", 8))
-        self._hist_export_btn.setFixedHeight(24)
-        self._hist_export_btn.setToolTip(
-            "Save the current histogram (bin centres + counts) as a tab-separated text file.")
-        self._hist_export_btn.clicked.connect(self._on_export_histogram)
-        toolbar.addWidget(self._hist_export_btn)
-
         zoom_hint = QLabel("Ctrl+scroll to zoom")
         zoom_hint.setFont(QFont("Helvetica", 8))
         toolbar.addWidget(zoom_hint)
         toolbar.addStretch()
         left_lay.addLayout(toolbar)
+
+        selection_bar = QHBoxLayout()
+        selection_bar.setSpacing(4)
+        selection_lbl = QLabel("Selection")
+        selection_lbl.setFont(QFont("Helvetica", 8, QFont.Bold))
+        selection_bar.addWidget(selection_lbl)
+        self._selection_group = QButtonGroup(self)
+        self._selection_group.setExclusive(True)
+        for key, label, tip in (
+            ("none", "↖", "Pointer / no selection tool"),
+            ("rectangle", "▭", "Rectangular area selection"),
+            ("ellipse", "○", "Elliptical area selection"),
+            ("polygon", "◇", "Polygon area selection; double-click to finish"),
+            ("line", "╱", "Line selection for display/status only"),
+        ):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setFixedSize(28, 24)
+            btn.setFont(QFont("Helvetica", 10, QFont.Bold))
+            btn.setToolTip(tip)
+            self._selection_group.addButton(btn)
+            btn.setProperty("selection_tool", key)
+            if key == "none":
+                btn.setChecked(True)
+            selection_bar.addWidget(btn)
+        self._selection_group.buttonClicked.connect(self._on_selection_tool_clicked)
+        clear_selection_btn = QPushButton("Clear")
+        clear_selection_btn.setFont(QFont("Helvetica", 8))
+        clear_selection_btn.setFixedHeight(24)
+        clear_selection_btn.clicked.connect(self._on_clear_roi)
+        selection_bar.addWidget(clear_selection_btn)
+        selection_bar.addStretch()
+        left_lay.addLayout(selection_bar)
 
         # Rulers scroll together with the image (placed in the same scroll
         # viewport via a small grid container).
@@ -791,26 +809,22 @@ class ImageViewerDialog(QDialog):
             btn.toggled.connect(_sync)
             return btn, body, body_lay
 
-        def _small_slider(label: str, mn: int, mx: int, init: int,
-                          fmt="{v}") -> tuple[QWidget, QSlider, QLabel]:
+        def _spin_row(label: str, mn: float, mx: float, init: float,
+                      step: float, decimals: int) -> tuple[QWidget, QDoubleSpinBox]:
             w = QWidget()
             row = QHBoxLayout(w)
             row.setContentsMargins(0, 0, 0, 0)
             lbl = QLabel(label)
             lbl.setFont(QFont("Helvetica", 8))
-            lbl.setFixedWidth(56)
-            sl = QSlider(Qt.Horizontal)
-            sl.setRange(mn, mx)
-            sl.setValue(init)
-            val_lbl = QLabel(fmt.format(v=init))
-            val_lbl.setFont(QFont("Helvetica", 8))
-            val_lbl.setFixedWidth(34)
-            sl.valueChanged.connect(
-                lambda v, vl=val_lbl, f=fmt: vl.setText(f.format(v=v)))
+            spin = QDoubleSpinBox()
+            spin.setRange(float(mn), float(mx))
+            spin.setDecimals(decimals)
+            spin.setSingleStep(float(step))
+            spin.setValue(float(init))
+            spin.setFont(QFont("Helvetica", 8))
             row.addWidget(lbl)
-            row.addWidget(sl, 1)
-            row.addWidget(val_lbl)
-            return w, sl, val_lbl
+            row.addWidget(spin, 1)
+            return w, spin
 
         # histogram
         hist_lbl = QLabel("Histogram — drag the red/green lines to clip")
@@ -823,6 +837,8 @@ class ImageViewerDialog(QDialog):
         self._ax   = self._fig.add_subplot(111)
         self._canvas = FigureCanvasQTAgg(self._fig)
         self._canvas.setFixedHeight(220)
+        self._canvas.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._canvas.customContextMenuRequested.connect(self._on_hist_context_menu)
         right_lay.addWidget(self._canvas)
 
         # histogram drag state
@@ -834,6 +850,17 @@ class ImageViewerDialog(QDialog):
         self._canvas.mpl_connect("button_press_event",   self._on_hist_press)
         self._canvas.mpl_connect("motion_notify_event",  self._on_hist_motion)
         self._canvas.mpl_connect("button_release_event", self._on_hist_release)
+
+        hist_actions = QHBoxLayout()
+        self._auto_clip_btn = QPushButton("Auto")
+        self._auto_clip_btn.setFont(QFont("Helvetica", 8))
+        self._auto_clip_btn.setFixedHeight(22)
+        self._auto_clip_btn.setToolTip(
+            "Autoscale display bounds to the current image's 1%–99% percentiles.")
+        self._auto_clip_btn.clicked.connect(self._on_auto_clip)
+        hist_actions.addStretch()
+        hist_actions.addWidget(self._auto_clip_btn)
+        right_lay.addLayout(hist_actions)
 
         # Å / pA value readout for current display bounds
         self._clip_val_lbl = QLabel("")
@@ -849,6 +876,52 @@ class ImageViewerDialog(QDialog):
 
         self._processing_panel = ProcessingControlPanel("viewer_full")
         right_lay.addWidget(self._processing_panel)
+
+        self._set_zero_plane_btn = QPushButton("Set zero plane (3 clicks)")
+        self._set_zero_plane_btn.setCheckable(True)
+        self._set_zero_plane_btn.setFont(QFont("Helvetica", 8))
+        self._set_zero_plane_btn.setFixedHeight(24)
+        self._set_zero_plane_btn.toggled.connect(self._on_set_zero_plane_mode_toggled)
+        right_lay.addWidget(self._set_zero_plane_btn)
+
+        self._set_zero_clear_btn = QPushButton("Clear zero references")
+        self._set_zero_clear_btn.setFont(QFont("Helvetica", 8))
+        self._set_zero_clear_btn.setFixedHeight(22)
+        self._set_zero_clear_btn.clicked.connect(self._on_clear_set_zero)
+        right_lay.addWidget(self._set_zero_clear_btn)
+
+        selection_use_lbl = QLabel("Selection use")
+        selection_use_lbl.setFont(QFont("Helvetica", 8, QFont.Bold))
+        right_lay.addWidget(selection_use_lbl)
+
+        self._scope_cb = QComboBox()
+        self._scope_cb.addItems(["Whole image", "Selected region only"])
+        self._scope_cb.setFont(QFont("Helvetica", 8))
+        self._scope_cb.setToolTip(
+            "Selected-region processing applies local filters only; backgrounds and scan-line tools remain whole-image operations."
+        )
+        right_lay.addWidget(self._scope_cb)
+
+        self._bg_fit_roi_cb = QCheckBox("Fit surface background from selection")
+        self._bg_fit_roi_cb.setFont(QFont("Helvetica", 8))
+        self._bg_fit_roi_cb.setToolTip(
+            "Fits Plane/Quadratic/Cubic/Quartic background using selected area pixels, "
+            "then subtracts that fitted surface from the whole image."
+        )
+        right_lay.addWidget(self._bg_fit_roi_cb)
+
+        self._patch_roi_cb = QCheckBox("Patch-interpolate selection")
+        self._patch_roi_cb.setFont(QFont("Helvetica", 8))
+        self._patch_roi_cb.setToolTip(
+            "Fills the selected area by Laplace patch interpolation. "
+            "Line selections cannot be patch-interpolated."
+        )
+        right_lay.addWidget(self._patch_roi_cb)
+
+        self._roi_status_lbl = QLabel("Selection: none")
+        self._roi_status_lbl.setFont(QFont("Helvetica", 8))
+        self._roi_status_lbl.setWordWrap(True)
+        right_lay.addWidget(self._roi_status_lbl)
 
         proc_apply_btn = QPushButton("Apply processing")
         proc_apply_btn.setFont(QFont("Helvetica", 8))
@@ -868,58 +941,6 @@ class ImageViewerDialog(QDialog):
 
         right_lay.addWidget(_sep())
 
-        # ROI selection plumbing for local image filters; global/background
-        # corrections still run against the whole image.
-        self._selection_toggle, self._selection_widget, selection_lay = (
-            _collapsible_section("Selection tools", expanded=False)
-        )
-
-        roi_row = QHBoxLayout()
-        self._roi_btn = QPushButton("Select region")
-        self._roi_btn.setCheckable(True)
-        self._roi_btn.setFont(QFont("Helvetica", 8))
-        self._roi_btn.setFixedHeight(24)
-        self._roi_btn.toggled.connect(self._on_roi_mode_toggled)
-        roi_row.addWidget(self._roi_btn, 1)
-
-        self._roi_clear_btn = QPushButton("Clear")
-        self._roi_clear_btn.setFont(QFont("Helvetica", 8))
-        self._roi_clear_btn.setFixedHeight(24)
-        self._roi_clear_btn.clicked.connect(self._on_clear_roi)
-        roi_row.addWidget(self._roi_clear_btn)
-        selection_lay.addLayout(roi_row)
-
-        self._scope_cb = QComboBox()
-        self._scope_cb.addItems(["Whole image", "Selected region only"])
-        self._scope_cb.setFont(QFont("Helvetica", 8))
-        self._scope_cb.setToolTip(
-            "Selected-region processing applies local filters only; backgrounds and scan-line tools remain whole-image operations."
-        )
-        selection_lay.addWidget(self._scope_cb)
-
-        self._bg_fit_roi_cb = QCheckBox("Fit surface background from selection")
-        self._bg_fit_roi_cb.setFont(QFont("Helvetica", 8))
-        self._bg_fit_roi_cb.setToolTip(
-            "Fits Plane/Quadratic/Cubic/Quartic background using the selected pixels, "
-            "then subtracts that fitted surface from the whole image."
-        )
-        selection_lay.addWidget(self._bg_fit_roi_cb)
-
-        self._patch_roi_cb = QCheckBox("Patch-interpolate selection")
-        self._patch_roi_cb.setFont(QFont("Helvetica", 8))
-        self._patch_roi_cb.setToolTip(
-            "Fills the selected rectangle by Laplace patch interpolation. "
-            "Use for local scan defects before FFT/correlation work."
-        )
-        selection_lay.addWidget(self._patch_roi_cb)
-
-        self._roi_status_lbl = QLabel("Selection: none")
-        self._roi_status_lbl.setFont(QFont("Helvetica", 8))
-        self._roi_status_lbl.setWordWrap(True)
-        selection_lay.addWidget(self._roi_status_lbl)
-
-        right_lay.addWidget(_sep())
-
         self._advanced_toggle, self._advanced_widget, advanced_lay = (
             _collapsible_section("Advanced tools", expanded=False)
         )
@@ -935,36 +956,23 @@ class ImageViewerDialog(QDialog):
         undistort_lbl.setAlignment(Qt.AlignCenter)
         advanced_lay.addWidget(undistort_lbl)
 
-        self._undistort_shear_w, self._undistort_shear_sl, _ = _small_slider(
-            "Shear x:", -20, 20, 0, "{v}px")
+        self._undistort_shear_w, self._undistort_shear_spin = _spin_row(
+            "Shear x (px):", -20.0, 20.0, 0.0, 0.25, 2)
         advanced_lay.addWidget(self._undistort_shear_w)
-        self._undistort_scale_w, self._undistort_scale_sl, _ = _small_slider(
-            "Scale y:", 80, 120, 100, "{v}%")
+        self._undistort_scale_w, self._undistort_scale_spin = _spin_row(
+            "Scale y:", 0.80, 1.20, 1.0, 0.005, 3)
         advanced_lay.addWidget(self._undistort_scale_w)
-
-        self._set_zero_plane_btn = QPushButton("Set zero plane (3 clicks)")
-        self._set_zero_plane_btn.setCheckable(True)
-        self._set_zero_plane_btn.setFont(QFont("Helvetica", 8))
-        self._set_zero_plane_btn.setFixedHeight(24)
-        self._set_zero_plane_btn.toggled.connect(self._on_set_zero_plane_mode_toggled)
-        advanced_lay.addWidget(self._set_zero_plane_btn)
-
-        self._set_zero_clear_btn = QPushButton("Clear zero references")
-        self._set_zero_clear_btn.setFont(QFont("Helvetica", 8))
-        self._set_zero_clear_btn.setFixedHeight(22)
-        self._set_zero_clear_btn.clicked.connect(self._on_clear_set_zero)
-        advanced_lay.addWidget(self._set_zero_clear_btn)
 
         right_lay.addWidget(_sep())
 
-        # spec position overlay toggle
+        # Spec marker selection should eventually move to the Browse mapping workflow.
         self._spec_overlay_toggle, self._spec_overlay_widget, spec_lay = (
             _collapsible_section("Spectroscopy overlay", expanded=False)
         )
 
         self._spec_show_cb = QCheckBox("Show spec positions")
         self._spec_show_cb.setFont(QFont("Helvetica", 8))
-        self._spec_show_cb.setChecked(True)
+        self._spec_show_cb.setChecked(False)
         self._spec_show_cb.toggled.connect(self._on_spec_show_toggled)
         spec_lay.addWidget(self._spec_show_cb)
 
@@ -980,6 +988,7 @@ class ImageViewerDialog(QDialog):
 
         self._zoom_lbl.marker_clicked.connect(self._on_marker_clicked)
         self._zoom_lbl.pixel_clicked.connect(self._on_set_zero_pick)
+        self._zoom_lbl.selection_changed.connect(self._on_selection_changed)
         self._zoom_lbl.roi_selected.connect(self._on_roi_selected)
         self._zoom_lbl.pixmap_resized.connect(self._on_pixmap_resized)
 
@@ -1382,16 +1391,106 @@ class ImageViewerDialog(QDialog):
         dlg = SpecViewerDialog(entry, self._t, self)
         dlg.exec()
 
-    def _on_roi_mode_toggled(self, checked: bool):
-        if checked and self._set_zero_plane_btn.isChecked():
+    def _current_array_shape(self) -> tuple[int, int] | None:
+        arr = self._raw_arr if self._raw_arr is not None else self._display_arr
+        return None if arr is None else arr.shape
+
+    def _set_selection_tool(self, kind: str) -> None:
+        kind = str(kind or "none")
+        for btn in self._selection_group.buttons():
+            if btn.property("selection_tool") == kind:
+                btn.setChecked(True)
+                break
+        self._zoom_lbl.set_selection_tool(kind)
+
+    def _on_selection_tool_clicked(self, button) -> None:
+        if self._set_zero_plane_btn.isChecked():
             self._set_zero_plane_btn.setChecked(False)
-        self._zoom_lbl.set_roi_mode(checked)
-        self._roi_btn.setText("Selecting..." if checked else "Select region")
+        self._zoom_lbl.set_selection_tool(button.property("selection_tool") or "none")
+
+    def _selection_geometry_to_pixels(self, geometry: dict | None) -> dict | None:
+        shape = self._current_array_shape()
+        if not geometry or shape is None:
+            return None
+        Ny, Nx = shape
+        out = {"kind": str(geometry.get("kind", ""))}
+        if geometry.get("bounds_frac") is not None:
+            try:
+                x0f, y0f, x1f, y1f = [float(v) for v in geometry["bounds_frac"]]
+            except (TypeError, ValueError):
+                return None
+            x0 = max(0, min(Nx - 1, int(round(min(x0f, x1f) * (Nx - 1)))))
+            x1 = max(0, min(Nx - 1, int(round(max(x0f, x1f) * (Nx - 1)))))
+            y0 = max(0, min(Ny - 1, int(round(min(y0f, y1f) * (Ny - 1)))))
+            y1 = max(0, min(Ny - 1, int(round(max(y0f, y1f) * (Ny - 1)))))
+            if x1 <= x0 or y1 <= y0:
+                return None
+            out["bounds_frac"] = tuple(float(v) for v in geometry["bounds_frac"])
+            out["rect_px"] = (x0, y0, x1, y1)
+        if geometry.get("points_frac") is not None:
+            points_px = []
+            points_frac = []
+            for item in geometry.get("points_frac", ()):
+                try:
+                    xf, yf = float(item[0]), float(item[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                xf = max(0.0, min(1.0, xf))
+                yf = max(0.0, min(1.0, yf))
+                points_frac.append((xf, yf))
+                points_px.append((
+                    max(0, min(Nx - 1, int(round(xf * (Nx - 1))))),
+                    max(0, min(Ny - 1, int(round(yf * (Ny - 1))))),
+                ))
+            if out["kind"] == "polygon" and len(points_px) < 3:
+                return None
+            if out["kind"] == "line" and len(points_px) < 2:
+                return None
+            out["points_frac"] = points_frac
+            out["points_px"] = points_px
+        return out
+
+    def _area_selection_geometry_px(self) -> dict | None:
+        geometry = self._selection_geometry
+        if not geometry:
+            return None
+        if geometry.get("kind") == "line":
+            return None
+        return geometry if geometry.get("kind") in {"rectangle", "ellipse", "polygon"} else None
+
+    def _selection_status_text(self, geometry: dict | None) -> str:
+        if not geometry:
+            return "Selection: none"
+        kind = geometry.get("kind", "selection")
+        if kind == "line" and geometry.get("points_px"):
+            (x0, y0), (x1, y1) = geometry["points_px"][:2]
+            return f"Selection: line ({x0}, {y0}) → ({x1}, {y1}); display only"
+        if kind == "polygon" and geometry.get("points_px"):
+            return f"Selection: polygon, {len(geometry['points_px'])} vertices"
+        if geometry.get("rect_px"):
+            x0, y0, x1, y1 = geometry["rect_px"]
+            return (
+                f"Selection: {kind}, x {x0}-{x1}, y {y0}-{y1} "
+                f"({x1 - x0 + 1} x {y1 - y0 + 1} px)"
+            )
+        return f"Selection: {kind}"
+
+    def _on_selection_changed(self, geometry) -> None:
+        converted = self._selection_geometry_to_pixels(dict(geometry or {}))
+        if converted is None:
+            self._selection_geometry = None
+            self._roi_rect_px = None
+            self._roi_status_lbl.setText("Selection: none")
+            return
+        self._selection_geometry = converted
+        self._roi_rect_px = (
+            converted.get("rect_px") if converted.get("kind") == "rectangle" else None
+        )
+        self._roi_status_lbl.setText(self._selection_status_text(converted))
 
     def _on_set_zero_plane_mode_toggled(self, checked: bool):
-        if checked and self._roi_btn.isChecked():
-            self._roi_btn.setChecked(False)
         if checked:
+            self._set_selection_tool("none")
             self._zero_pick_mode = "plane"
             self._zero_plane_points_px = []
             self._status_lbl.setText("Click 3 reference points to define the zero plane.")
@@ -1413,24 +1512,28 @@ class ImageViewerDialog(QDialog):
         if x1 <= x0 or y1 <= y0:
             self._on_clear_roi()
             return
-        self._roi_rect_px = (x0, y0, x1, y1)
-        self._roi_status_lbl.setText(
-            f"Selection: x {x0}-{x1}, y {y0}-{y1} "
-            f"({x1 - x0 + 1} x {y1 - y0 + 1} px)"
-        )
-        if self._roi_btn.isChecked():
-            self._roi_btn.setChecked(False)
+        geometry = {
+            "kind": "rectangle",
+            "bounds_frac": (x0f, y0f, x1f, y1f),
+            "rect_px": (x0, y0, x1, y1),
+        }
+        self._selection_geometry = geometry
+        self._roi_rect_px = geometry["rect_px"]
+        self._roi_status_lbl.setText(self._selection_status_text(geometry))
 
     def _on_clear_roi(self):
         self._roi_rect_px = None
+        self._selection_geometry = None
         self._processing.pop("processing_scope", None)
         self._processing.pop("roi_rect", None)
+        self._processing.pop("roi_geometry", None)
         self._processing.pop("background_fit_rect", None)
+        self._processing.pop("background_fit_geometry", None)
         self._processing.pop("patch_interpolate_rect", None)
+        self._processing.pop("patch_interpolate_geometry", None)
         self._processing.pop("patch_interpolate_iterations", None)
         self._zoom_lbl.clear_roi()
-        if self._roi_btn.isChecked():
-            self._roi_btn.setChecked(False)
+        self._set_selection_tool("none")
         self._scope_cb.setCurrentIndex(0)
         self._bg_fit_roi_cb.setChecked(False)
         self._patch_roi_cb.setChecked(False)
@@ -1576,6 +1679,16 @@ class ImageViewerDialog(QDialog):
         self._clip_high = 99.0
         self._refresh_display_range()
 
+    def _on_hist_context_menu(self, pos):
+        menu = QMenu(self)
+        auto_action = menu.addAction("Auto display range")
+        export_action = menu.addAction("Export histogram...")
+        chosen = menu.exec(self._canvas.mapToGlobal(pos))
+        if chosen is auto_action:
+            self._on_auto_clip()
+        elif chosen is export_action:
+            self._on_export_histogram()
+
     def _on_export_histogram(self):
         """Save the current histogram (bin centres + counts) as a TSV file."""
         flat = self._hist_flat_phys
@@ -1667,10 +1780,10 @@ class ImageViewerDialog(QDialog):
 
     # ── Controls ───────────────────────────────────────────────────────────────
     def _advanced_processing_state(self) -> dict:
-        if not hasattr(self, "_undistort_shear_sl"):
+        if not hasattr(self, "_undistort_shear_spin"):
             return {}
-        shear_x = float(self._undistort_shear_sl.value())
-        scale_y = self._undistort_scale_sl.value() / 100.0
+        shear_x = float(self._undistort_shear_spin.value())
+        scale_y = float(self._undistort_scale_spin.value())
         return {
             "linear_undistort": (shear_x != 0.0 or scale_y != 1.0),
             "undistort_shear_x": shear_x,
@@ -1678,12 +1791,11 @@ class ImageViewerDialog(QDialog):
         }
 
     def _set_advanced_processing_state(self, state: dict | None) -> None:
-        if not hasattr(self, "_undistort_shear_sl"):
+        if not hasattr(self, "_undistort_shear_spin"):
             return
         state = state or {}
-        self._undistort_shear_sl.setValue(int(state.get("undistort_shear_x", 0)))
-        self._undistort_scale_sl.setValue(
-            int(round(float(state.get("undistort_scale_y", 1.0)) * 100)))
+        self._undistort_shear_spin.setValue(float(state.get("undistort_shear_x", 0.0)))
+        self._undistort_scale_spin.setValue(float(state.get("undistort_scale_y", 1.0)))
 
     def _on_periodic_filter(self):
         arr = self._display_arr if self._display_arr is not None else self._raw_arr
@@ -1713,9 +1825,16 @@ class ImageViewerDialog(QDialog):
         wants_filter_roi = self._scope_cb.currentIndex() == 1
         wants_bg_fit_roi = self._bg_fit_roi_cb.isChecked()
         wants_patch_roi = self._patch_roi_cb.isChecked()
-        if (wants_filter_roi or wants_bg_fit_roi or wants_patch_roi) and self._roi_rect_px is None:
-            self._status_lbl.setText("Select a region before using selection-based processing.")
-            return
+        selection_geometry = self._area_selection_geometry_px()
+        if wants_filter_roi or wants_bg_fit_roi or wants_patch_roi:
+            if self._selection_geometry and self._selection_geometry.get("kind") == "line":
+                self._status_lbl.setText(
+                    "Line selections are display-only; choose an area selection for processing."
+                )
+                return
+            if selection_geometry is None:
+                self._status_lbl.setText("Select an area before using selection-based processing.")
+                return
         preserve = {
             key: self._processing[key]
             for key in (
@@ -1732,25 +1851,42 @@ class ImageViewerDialog(QDialog):
         self._processing.update(preserve)
         if wants_filter_roi:
             self._processing["processing_scope"] = "roi"
-            self._processing["roi_rect"] = self._roi_rect_px
+            self._processing["roi_geometry"] = dict(selection_geometry)
+            if selection_geometry.get("kind") == "rectangle":
+                self._processing["roi_rect"] = selection_geometry.get("rect_px")
+            else:
+                self._processing.pop("roi_rect", None)
         else:
             self._processing.pop("processing_scope", None)
             self._processing.pop("roi_rect", None)
+            self._processing.pop("roi_geometry", None)
         if wants_bg_fit_roi and self._processing.get("bg_order") is not None:
-            self._processing["background_fit_rect"] = self._roi_rect_px
+            self._processing["background_fit_geometry"] = dict(selection_geometry)
+            if selection_geometry.get("kind") == "rectangle":
+                self._processing["background_fit_rect"] = selection_geometry.get("rect_px")
+            else:
+                self._processing.pop("background_fit_rect", None)
         else:
             self._processing.pop("background_fit_rect", None)
+            self._processing.pop("background_fit_geometry", None)
         if wants_patch_roi:
-            self._processing["patch_interpolate_rect"] = self._roi_rect_px
+            self._processing["patch_interpolate_geometry"] = dict(selection_geometry)
+            if selection_geometry.get("kind") == "rectangle":
+                self._processing["patch_interpolate_rect"] = selection_geometry.get("rect_px")
+            else:
+                self._processing.pop("patch_interpolate_rect", None)
             self._processing["patch_interpolate_iterations"] = 200
         else:
             self._processing.pop("patch_interpolate_rect", None)
+            self._processing.pop("patch_interpolate_geometry", None)
             self._processing.pop("patch_interpolate_iterations", None)
         self._refresh_processing_display()
 
     def _on_reset_processing(self):
         """Clear all processing for the current image and reload raw data."""
-        if not self._processing:
+        has_selection = self._selection_geometry is not None or self._roi_rect_px is not None
+        has_zero = bool(self._zero_plane_points_px)
+        if not self._processing and not has_selection and not has_zero:
             self._status_lbl.setText("Already showing the original — nothing to reset.")
             return
         self._processing = {}
@@ -1761,6 +1897,13 @@ class ImageViewerDialog(QDialog):
             self._set_zero_plane_btn.setChecked(False)
         self._zero_plane_points_px = []
         self._roi_rect_px = None
+        self._selection_geometry = None
+        self._zoom_lbl.clear_roi()
+        self._set_selection_tool("none")
+        self._scope_cb.setCurrentIndex(0)
+        self._bg_fit_roi_cb.setChecked(False)
+        self._patch_roi_cb.setChecked(False)
+        self._roi_status_lbl.setText("Selection: none")
         self._refresh_zero_markers()
         self._status_lbl.setText("Reset: showing original on-disk data.")
         self._refresh_processing_display()

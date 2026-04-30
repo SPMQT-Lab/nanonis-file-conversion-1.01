@@ -20,6 +20,7 @@ NUMERIC_PROC_KEYS: tuple[str, ...] = (
     "bg_order",
     "bg_step_tolerance",
     "background_fit_rect",
+    "background_fit_geometry",
     "stm_line_bg",
     "facet_level",
     "smooth_sigma",
@@ -30,12 +31,14 @@ NUMERIC_PROC_KEYS: tuple[str, ...] = (
     "periodic_notches",
     "periodic_notch_radius",
     "patch_interpolate_rect",
+    "patch_interpolate_geometry",
     "patch_interpolate_iterations",
     "linear_undistort",
     "set_zero_xy",
     "set_zero_plane_points",
     "processing_scope",
     "roi_rect",
+    "roi_geometry",
 )
 
 
@@ -61,6 +64,7 @@ def processing_state_from_gui(gui_state: dict) -> "ProcessingState":
         "fft_soft_border",
     }
     roi_rect = None
+    roi_geometry = gui_state.get("roi_geometry")
     if roi_scope:
         try:
             roi_rect = tuple(int(v) for v in gui_state.get("roi_rect", ()))
@@ -68,13 +72,17 @@ def processing_state_from_gui(gui_state: dict) -> "ProcessingState":
                 roi_rect = None
         except (TypeError, ValueError):
             roi_rect = None
+        if not _area_geometry(roi_geometry):
+            roi_geometry = None
 
     def _append_step(step: ProcessingStep):
-        if roi_rect is not None and step.op in roi_eligible:
-            steps.append(ProcessingStep("roi", {
-                "rect": roi_rect,
-                "step": {"op": step.op, "params": dict(step.params)},
-            }))
+        if step.op in roi_eligible and (roi_geometry is not None or roi_rect is not None):
+            params = {"step": {"op": step.op, "params": dict(step.params)}}
+            if roi_geometry is not None:
+                params["geometry"] = dict(roi_geometry)
+            if roi_rect is not None:
+                params["rect"] = roi_rect
+            steps.append(ProcessingStep("roi", params))
         else:
             steps.append(step)
 
@@ -92,6 +100,7 @@ def processing_state_from_gui(gui_state: dict) -> "ProcessingState":
             "step_tolerance": bool(gui_state.get("bg_step_tolerance", False)),
         }
         fit_rect = gui_state.get("background_fit_rect")
+        fit_geometry = gui_state.get("background_fit_geometry")
         if fit_rect is not None:
             try:
                 fit_rect_tuple = tuple(int(v) for v in fit_rect)
@@ -99,6 +108,8 @@ def processing_state_from_gui(gui_state: dict) -> "ProcessingState":
                     params["fit_rect"] = fit_rect_tuple
             except (TypeError, ValueError):
                 pass
+        if _area_geometry(fit_geometry):
+            params["fit_geometry"] = dict(fit_geometry)
         _append_step(ProcessingStep("plane_bg", params))
 
     if gui_state.get("stm_line_bg") == "step_tolerant":
@@ -126,7 +137,21 @@ def processing_state_from_gui(gui_state: dict) -> "ProcessingState":
         }))
 
     patch_rect = gui_state.get("patch_interpolate_rect")
-    if patch_rect is not None:
+    patch_geometry = gui_state.get("patch_interpolate_geometry")
+    if _area_geometry(patch_geometry):
+        params = {
+            "geometry": dict(patch_geometry),
+            "iterations": int(gui_state.get("patch_interpolate_iterations", 200)),
+        }
+        if patch_geometry.get("kind") == "rectangle":
+            try:
+                rect = tuple(int(v) for v in patch_geometry.get("rect_px", ()))
+                if len(rect) == 4:
+                    params["rect"] = rect
+            except (TypeError, ValueError):
+                pass
+        _append_step(ProcessingStep("patch_interpolate", params))
+    elif patch_rect is not None:
         try:
             patch_rect_tuple = tuple(int(v) for v in patch_rect)
         except (TypeError, ValueError):
@@ -202,6 +227,12 @@ def processing_state_from_gui(gui_state: dict) -> "ProcessingState":
             }))
 
     return ProcessingState(steps=steps)
+
+
+def _area_geometry(geometry) -> bool:
+    if not isinstance(geometry, dict):
+        return False
+    return geometry.get("kind") in {"rectangle", "ellipse", "polygon"}
 
 
 def processing_history_entries_from_state(

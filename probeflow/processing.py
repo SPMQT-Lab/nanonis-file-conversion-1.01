@@ -108,6 +108,7 @@ def subtract_background(
     step_tolerance: bool = False,
     step_threshold_deg: float = 3.0,
     fit_rect: Optional[tuple[int, int, int, int]] = None,
+    fit_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Fit and subtract a 2D polynomial background from an image.
 
@@ -128,6 +129,10 @@ def subtract_background(
         Optional inclusive pixel rectangle ``(x0, y0, x1, y1)`` limiting which
         pixels contribute to the polynomial fit. The fitted background is still
         reconstructed and subtracted over the whole image.
+    fit_mask:
+        Optional boolean mask selecting pixels that contribute to the fit.
+        Combined with ``fit_rect`` and finite-pixel filtering when both are
+        supplied.
 
     Coordinates are normalised to [-1, 1] for numerical stability. Only
     finite pixels participate in the least-squares fit. NaNs in the input
@@ -152,6 +157,7 @@ def subtract_background(
     if finite.sum() < n_terms:
         return arr
 
+    user_fit_mask = fit_mask
     fit_mask = finite
     if fit_rect is not None:
         try:
@@ -170,12 +176,23 @@ def subtract_background(
         if fit_mask.sum() < n_terms:
             return arr
 
+    if user_fit_mask is not None:
+        try:
+            user_mask = np.asarray(user_fit_mask, dtype=bool)
+        except (TypeError, ValueError):
+            return arr
+        if user_mask.shape != arr.shape:
+            return arr
+        fit_mask = fit_mask & user_mask.ravel()
+        if fit_mask.sum() < n_terms:
+            return arr
+
     if step_tolerance and Ny >= 3 and Nx >= 3:
         gy, gx = np.gradient(np.where(np.isfinite(arr), arr, 0.0))
         slope_mag = np.sqrt(gx ** 2 + gy ** 2).ravel()
         tan_thresh = math.tan(math.radians(step_threshold_deg))
         candidate = finite & (slope_mag < tan_thresh)
-        if fit_rect is not None:
+        if fit_rect is not None or user_fit_mask is not None:
             candidate = candidate & fit_mask
         if candidate.sum() >= n_terms:
             fit_mask = candidate

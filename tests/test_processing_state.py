@@ -245,6 +245,20 @@ class TestGuiConversion:
             "params": {"sigma_px": 1.5},
         }
 
+    def test_roi_scope_wraps_local_filter_with_shape_geometry(self):
+        geometry = {"kind": "ellipse", "rect_px": (2, 3, 8, 9)}
+        state = processing_state_from_gui({
+            "processing_scope": "roi",
+            "roi_geometry": geometry,
+            "smooth_sigma": 1.5,
+        })
+        assert len(state.steps) == 1
+        step = state.steps[0]
+        assert step.op == "roi"
+        assert step.params["geometry"] == geometry
+        assert "rect" not in step.params
+        assert step.params["step"]["op"] == "smooth"
+
     def test_roi_scope_keeps_global_background_steps_global(self):
         gui = {
             "processing_scope": "roi",
@@ -300,6 +314,22 @@ class TestGuiConversion:
         assert state.steps[0].op == "patch_interpolate"
         assert state.steps[0].params == {
             "rect": (3, 4, 8, 9),
+            "iterations": 50,
+        }
+
+    def test_patch_interpolate_gui_shape_geometry_captured(self):
+        geometry = {
+            "kind": "polygon",
+            "points_px": [(3, 4), (8, 4), (5, 9)],
+        }
+        state = processing_state_from_gui({
+            "patch_interpolate_geometry": geometry,
+            "patch_interpolate_iterations": 50,
+        })
+        assert len(state.steps) == 1
+        assert state.steps[0].op == "patch_interpolate"
+        assert state.steps[0].params == {
+            "geometry": geometry,
             "iterations": 50,
         }
 
@@ -564,6 +594,49 @@ class TestApplyKnownSteps:
         outside[5:11, 5:11] = False
         np.testing.assert_array_equal(result[outside], arr[outside])
         assert not np.allclose(result[5:11, 5:11], arr[5:11, 5:11])
+
+    def test_roi_smooth_changes_only_selected_ellipse_mask(self):
+        rng = np.random.default_rng(4)
+        arr = np.zeros((18, 18), dtype=float)
+        arr[4:14, 4:14] = rng.normal(size=(10, 10))
+        geometry = {
+            "kind": "ellipse",
+            "rect_px": (4, 4, 13, 13),
+        }
+        state = ProcessingState(steps=[
+            ProcessingStep("roi", {
+                "geometry": geometry,
+                "step": {"op": "smooth", "params": {"sigma_px": 1.0}},
+            }),
+        ])
+        result = apply_processing_state(arr, state)
+
+        from probeflow.processing_state import roi_geometry_mask
+        mask = roi_geometry_mask(arr.shape, geometry)
+        assert mask is not None
+        np.testing.assert_array_equal(result[~mask], arr[~mask])
+        assert not np.allclose(result[mask], arr[mask])
+
+    def test_patch_interpolate_accepts_polygon_mask(self):
+        arr = np.ones((16, 16), dtype=float)
+        geometry = {
+            "kind": "polygon",
+            "points_px": [(5, 5), (11, 5), (8, 11)],
+        }
+        from probeflow.processing_state import roi_geometry_mask
+        mask = roi_geometry_mask(arr.shape, geometry)
+        assert mask is not None
+        arr[mask] = 20.0
+        state = ProcessingState(steps=[
+            ProcessingStep("patch_interpolate", {
+                "geometry": geometry,
+                "iterations": 80,
+            }),
+        ])
+        result = apply_processing_state(arr, state)
+
+        np.testing.assert_array_equal(result[~mask], arr[~mask])
+        assert float(np.mean(result[mask])) < 5.0
 
     def test_roi_wrapper_ignores_nonlocal_nested_operation(self):
         x = np.linspace(0, 1, 12)

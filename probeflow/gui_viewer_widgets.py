@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt, QRect, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap, QWheelEvent
+from PySide6.QtCore import Qt, QPointF, QRect, Signal
+from PySide6.QtGui import (
+    QBrush, QColor, QFont, QPainter, QPen, QPixmap, QPolygonF, QWheelEvent,
+)
 from PySide6.QtWidgets import QLabel, QToolTip, QWidget
 
 # ── Physical-axis ruler (top / left of the image) ───────────────────────────
@@ -219,6 +221,7 @@ class _ZoomLabel(QLabel):
     marker_clicked = Signal(object)  # emits VertFile when user clicks a marker
     pixel_clicked  = Signal(float, float)  # (frac_x, frac_y) — only when set_zero_mode is on
     roi_selected   = Signal(float, float, float, float)  # fractional x0, y0, x1, y1
+    selection_changed = Signal(object)  # structured ROI geometry
     pixmap_resized = Signal(int)  # new pixmap width in pixels (zoom changes, source changes)
 
     def __init__(self, parent=None):
@@ -230,10 +233,11 @@ class _ZoomLabel(QLabel):
         self._show_markers: bool = True
         self._zero_markers: list[dict] = []  # each: {frac_x, frac_y, label}
         self._set_zero_mode: bool = False
-        self._roi_mode: bool = False
-        self._roi_start = None
-        self._roi_drag_rect = None
-        self._roi_rect_frac = None
+        self._selection_tool: str = "none"
+        self._selection_start = None
+        self._selection_drag = None
+        self._selection_geometry = None
+        self._polygon_points: list[tuple[float, float]] = []
         self.setMouseTracking(True)
 
     def set_set_zero_mode(self, enabled: bool):
@@ -241,17 +245,24 @@ class _ZoomLabel(QLabel):
         self._update_cursor()
 
     def set_roi_mode(self, enabled: bool):
-        self._roi_mode = bool(enabled)
-        if not enabled:
-            self._roi_start = None
-            self._roi_drag_rect = None
-            self.update()
+        self.set_selection_tool("rectangle" if enabled else "none")
+
+    def set_selection_tool(self, kind: str):
+        kind = str(kind or "none").lower()
+        if kind not in {"none", "rectangle", "ellipse", "polygon", "line"}:
+            kind = "none"
+        self._selection_tool = kind
+        self._selection_start = None
+        self._selection_drag = None
+        self._polygon_points = []
+        self.update()
         self._update_cursor()
 
     def clear_roi(self):
-        self._roi_start = None
-        self._roi_drag_rect = None
-        self._roi_rect_frac = None
+        self._selection_start = None
+        self._selection_drag = None
+        self._selection_geometry = None
+        self._polygon_points = []
         self.update()
 
     def set_roi_rect_frac(self, rect):
@@ -262,20 +273,20 @@ class _ZoomLabel(QLabel):
         so users can see which region has been selected/affected.
         """
         if rect is None:
-            self._roi_rect_frac = None
+            self._selection_geometry = None
         else:
             x0, y0, x1, y1 = [float(v) for v in rect]
-            self._roi_rect_frac = (
-                max(0.0, min(1.0, min(x0, x1))),
-                max(0.0, min(1.0, min(y0, y1))),
-                max(0.0, min(1.0, max(x0, x1))),
-                max(0.0, min(1.0, max(y0, y1))),
-            )
+            self._selection_geometry = {
+                "kind": "rectangle",
+                "bounds_frac": self._norm_bounds(x0, y0, x1, y1),
+            }
         self.update()
 
     def _update_cursor(self):
         self.setCursor(
-            Qt.CrossCursor if (self._set_zero_mode or self._roi_mode)
+            Qt.CrossCursor if (
+                self._set_zero_mode or self._selection_tool != "none"
+            )
             else Qt.ArrowCursor
         )
 
@@ -337,16 +348,48 @@ class _ZoomLabel(QLabel):
         """Fractional image coords → label pixel coords."""
         return int(frac_x * self.width()), int(frac_y * self.height())
 
-    def _roi_rect_from_frac(self) -> QRect | None:
-        if self._roi_rect_frac is None:
-            return None
-        x0, y0, x1, y1 = self._roi_rect_frac
+    def _norm_bounds(self, x0, y0, x1, y1) -> tuple[float, float, float, float]:
+        return (
+            max(0.0, min(1.0, min(float(x0), float(x1)))),
+            max(0.0, min(1.0, min(float(y0), float(y1)))),
+            max(0.0, min(1.0, max(float(x0), float(x1)))),
+            max(0.0, min(1.0, max(float(y0), float(y1)))),
+        )
+
+    def _frac_from_pos(self, pos) -> tuple[float, float]:
+        return (
+            max(0.0, min(1.0, pos.x() / float(max(1, self.width())))),
+            max(0.0, min(1.0, pos.y() / float(max(1, self.height())))),
+        )
+
+    def _rect_from_bounds(self, bounds) -> QRect:
+        x0, y0, x1, y1 = bounds
         return QRect(
             int(round(x0 * self.width())),
             int(round(y0 * self.height())),
             int(round((x1 - x0) * self.width())),
             int(round((y1 - y0) * self.height())),
         ).normalized()
+
+    def _active_selection(self):
+        if self._selection_drag is not None:
+            return self._selection_drag
+        return self._selection_geometry
+
+    def _selection_points_px(self, points):
+        return [
+            QPointF(float(x) * self.width(), float(y) * self.height())
+            for x, y in points
+        ]
+
+    def _roi_rect_from_frac(self) -> QRect | None:
+        geometry = self._active_selection()
+        if geometry is None:
+            return None
+        bounds = geometry.get("bounds_frac")
+        if bounds is None:
+            return None
+        return self._rect_from_bounds(bounds)
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -384,16 +427,67 @@ class _ZoomLabel(QLabel):
                     painter.setPen(QPen(QColor("black")))
                     painter.drawText(QRect(sx - r, sy - r, 2 * r, 2 * r),
                                      Qt.AlignCenter, label)
-        roi_rect = self._roi_drag_rect or self._roi_rect_from_frac()
-        if roi_rect is not None:
+        geometry = self._active_selection()
+        if geometry is not None:
             painter.setBrush(QBrush(QColor(137, 180, 250, 45)))
             painter.setPen(QPen(QColor("#89b4fa"), 2))
-            painter.drawRect(roi_rect)
+            kind = geometry.get("kind")
+            if kind == "ellipse" and geometry.get("bounds_frac"):
+                rect = self._rect_from_bounds(geometry["bounds_frac"])
+                painter.drawEllipse(rect)
+                self._draw_selection_handles(painter, [
+                    (rect.left(), rect.top()), (rect.right(), rect.top()),
+                    (rect.right(), rect.bottom()), (rect.left(), rect.bottom()),
+                ])
+            elif kind == "polygon" and geometry.get("points_frac"):
+                pts = QPolygonF(self._selection_points_px(geometry["points_frac"]))
+                if len(pts) >= 2:
+                    painter.drawPolyline(pts)
+                if len(pts) >= 3 and geometry is self._selection_geometry:
+                    painter.drawPolygon(pts)
+                self._draw_selection_handles(painter, [(p.x(), p.y()) for p in pts])
+            elif kind == "line" and geometry.get("points_frac"):
+                pts = self._selection_points_px(geometry["points_frac"])
+                if len(pts) >= 2:
+                    painter.drawLine(pts[0], pts[-1])
+                    self._draw_selection_handles(
+                        painter,
+                        [(pts[0].x(), pts[0].y()), (pts[-1].x(), pts[-1].y())],
+                    )
+            elif geometry.get("bounds_frac"):
+                rect = self._rect_from_bounds(geometry["bounds_frac"])
+                painter.drawRect(rect)
+                self._draw_selection_handles(painter, [
+                    (rect.left(), rect.top()), (rect.right(), rect.top()),
+                    (rect.right(), rect.bottom()), (rect.left(), rect.bottom()),
+                ])
         painter.end()
 
+    def _draw_selection_handles(self, painter: QPainter, points) -> None:
+        painter.save()
+        painter.setBrush(QBrush(QColor("#89b4fa")))
+        painter.setPen(QPen(QColor("#11111b"), 1))
+        for x, y in points:
+            painter.drawEllipse(QPointF(float(x), float(y)), 3.5, 3.5)
+        painter.restore()
+
     def mouseMoveEvent(self, event):
-        if self._roi_mode and self._roi_start is not None:
-            self._roi_drag_rect = QRect(self._roi_start, event.pos()).normalized()
+        if (
+            self._selection_tool in {"rectangle", "ellipse", "line"}
+            and self._selection_start is not None
+        ):
+            fx0, fy0 = self._selection_start
+            fx1, fy1 = self._frac_from_pos(event.pos())
+            if self._selection_tool == "line":
+                self._selection_drag = {
+                    "kind": "line",
+                    "points_frac": [(fx0, fy0), (fx1, fy1)],
+                }
+            else:
+                self._selection_drag = {
+                    "kind": self._selection_tool,
+                    "bounds_frac": self._norm_bounds(fx0, fy0, fx1, fy1),
+                }
             self.update()
             return
         if self._show_markers and self._markers and self._pixmap_orig is not None:
@@ -416,10 +510,20 @@ class _ZoomLabel(QLabel):
         super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event):
-        if (event.button() == Qt.LeftButton and self._roi_mode
+        if (event.button() == Qt.LeftButton and self._selection_tool == "polygon"
                 and self._pixmap_orig is not None):
-            self._roi_start = event.pos()
-            self._roi_drag_rect = QRect(self._roi_start, self._roi_start)
+            self._polygon_points.append(self._frac_from_pos(event.pos()))
+            self._selection_drag = {
+                "kind": "polygon",
+                "points_frac": list(self._polygon_points),
+            }
+            self.update()
+            return
+        if (event.button() == Qt.LeftButton
+                and self._selection_tool in {"rectangle", "ellipse", "line"}
+                and self._pixmap_orig is not None):
+            self._selection_start = self._frac_from_pos(event.pos())
+            self._selection_drag = None
             self.update()
             return
         if (event.button() == Qt.LeftButton and self._show_markers
@@ -441,23 +545,59 @@ class _ZoomLabel(QLabel):
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if (event.button() == Qt.LeftButton and self._roi_mode
-                and self._roi_start is not None and self._pixmap_orig is not None):
-            rect = QRect(self._roi_start, event.pos()).normalized()
-            self._roi_start = None
-            if rect.width() >= 3 and rect.height() >= 3 and self.width() > 0 and self.height() > 0:
-                x0 = max(0.0, min(1.0, rect.left() / float(self.width())))
-                y0 = max(0.0, min(1.0, rect.top() / float(self.height())))
-                x1 = max(0.0, min(1.0, rect.right() / float(self.width())))
-                y1 = max(0.0, min(1.0, rect.bottom() / float(self.height())))
-                self._roi_drag_rect = None
-                self.set_roi_rect_frac((x0, y0, x1, y1))
-                self.roi_selected.emit(x0, y0, x1, y1)
+        if (
+            event.button() == Qt.LeftButton
+            and self._selection_tool in {"rectangle", "ellipse", "line"}
+            and self._selection_start is not None
+            and self._pixmap_orig is not None
+        ):
+            fx0, fy0 = self._selection_start
+            fx1, fy1 = self._frac_from_pos(event.pos())
+            self._selection_start = None
+            if self._selection_tool == "line":
+                geometry = {
+                    "kind": "line",
+                    "points_frac": [(fx0, fy0), (fx1, fy1)],
+                }
             else:
-                self._roi_drag_rect = None
+                bounds = self._norm_bounds(fx0, fy0, fx1, fy1)
+                if (
+                    abs(bounds[2] - bounds[0]) * self.width() < 3
+                    or abs(bounds[3] - bounds[1]) * self.height() < 3
+                ):
+                    self._selection_drag = None
+                    self.update()
+                    return
+                geometry = {
+                    "kind": self._selection_tool,
+                    "bounds_frac": bounds,
+                }
+            self._selection_drag = None
+            self._selection_geometry = geometry
+            self.selection_changed.emit(dict(geometry))
+            if geometry["kind"] == "rectangle":
+                x0, y0, x1, y1 = geometry["bounds_frac"]
+                self.roi_selected.emit(x0, y0, x1, y1)
             self.update()
             return
         super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if (
+            event.button() == Qt.LeftButton
+            and self._selection_tool == "polygon"
+            and len(self._polygon_points) >= 3
+        ):
+            self._selection_geometry = {
+                "kind": "polygon",
+                "points_frac": list(self._polygon_points),
+            }
+            self._selection_drag = None
+            self._polygon_points = []
+            self.selection_changed.emit(dict(self._selection_geometry))
+            self.update()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def wheelEvent(self, event: QWheelEvent):
         if event.modifiers() & Qt.ControlModifier:

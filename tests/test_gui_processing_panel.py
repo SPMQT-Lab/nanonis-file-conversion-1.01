@@ -90,9 +90,12 @@ def test_viewer_dialog_keeps_standard_processing_visible(qapp, monkeypatch):
 
     assert dlg._processing_panel.isHidden() is False
     assert not hasattr(dlg, "_set_zero_btn")
-    assert dlg._selection_widget.isVisible() is False
+    assert not hasattr(dlg, "_selection_widget")
+    assert hasattr(dlg, "_selection_group")
+    assert dlg._set_zero_plane_btn.isVisible() is True
     assert dlg._advanced_widget.isVisible() is False
     assert dlg._spec_overlay_widget.isVisible() is False
+    assert dlg._spec_show_cb.isChecked() is False
     assert dlg._export_widget.isVisible() is False
 
     dlg.close()
@@ -108,8 +111,8 @@ def test_viewer_apply_merges_standard_and_advanced_processing(qapp, monkeypatch)
     entry = SxmFile(path=Path("/tmp/example.sxm"), stem="example", Nx=8, Ny=8)
     dlg = ImageViewerDialog(entry, [entry], "gray", THEMES["dark"])
     dlg._processing_panel.set_state({"align_rows": "median", "bg_order": 2})
-    dlg._undistort_shear_sl.setValue(3)
-    dlg._undistort_scale_sl.setValue(110)
+    dlg._undistort_shear_spin.setValue(3.0)
+    dlg._undistort_scale_spin.setValue(1.10)
 
     dlg._on_apply_processing()
 
@@ -118,6 +121,30 @@ def test_viewer_apply_merges_standard_and_advanced_processing(qapp, monkeypatch)
     assert dlg._processing["linear_undistort"] is True
     assert dlg._processing["undistort_shear_x"] == 3.0
     assert dlg._processing["undistort_scale_y"] == 1.10
+
+    dlg.close()
+    dlg.deleteLater()
+
+
+def test_viewer_line_selection_rejected_for_processing(qapp, monkeypatch):
+    from probeflow.gui import ImageViewerDialog, SxmFile, THEMES
+
+    monkeypatch.setattr(ImageViewerDialog, "_load_current", lambda self: None)
+    monkeypatch.setattr(ImageViewerDialog, "_refresh_processing_display", lambda self: None)
+
+    entry = SxmFile(path=Path("/tmp/example.sxm"), stem="example", Nx=8, Ny=8)
+    dlg = ImageViewerDialog(entry, [entry], "gray", THEMES["dark"])
+    dlg._raw_arr = __import__("numpy").zeros((8, 8), dtype=float)
+    dlg._on_selection_changed({
+        "kind": "line",
+        "points_frac": [(0.0, 0.0), (1.0, 1.0)],
+    })
+    dlg._scope_cb.setCurrentIndex(1)
+
+    dlg._on_apply_processing()
+
+    assert "display-only" in dlg._status_lbl.text()
+    assert "processing_scope" not in dlg._processing
 
     dlg.close()
     dlg.deleteLater()

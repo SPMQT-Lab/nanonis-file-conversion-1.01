@@ -52,6 +52,104 @@ _ROI_ELIGIBLE_OPS: frozenset[str] = frozenset({
 })
 
 
+def roi_geometry_mask(
+    shape: tuple[int, int],
+    geometry: dict[str, Any] | None,
+) -> np.ndarray | None:
+    """Return a boolean mask for a rectangle/ellipse/polygon ROI geometry."""
+
+    if not geometry:
+        return None
+    try:
+        kind = str(geometry.get("kind", ""))
+    except AttributeError:
+        return None
+    if kind == "rectangle":
+        rect = geometry.get("rect_px") or geometry.get("rect") or ()
+        try:
+            x0, y0, x1, y1 = _clamped_rect(shape, rect)
+        except ValueError:
+            return None
+        mask = np.zeros(shape, dtype=bool)
+        mask[y0:y1 + 1, x0:x1 + 1] = True
+        return mask
+    if kind == "ellipse":
+        rect = geometry.get("rect_px") or geometry.get("bounds_px") or ()
+        try:
+            x0, y0, x1, y1 = _clamped_rect(shape, rect)
+        except ValueError:
+            return None
+        yy, xx = np.mgrid[:shape[0], :shape[1]]
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        rx = max(0.5, (x1 - x0 + 1) / 2.0)
+        ry = max(0.5, (y1 - y0 + 1) / 2.0)
+        return (((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2) <= 1.0
+    if kind == "polygon":
+        points = _points_from_geometry(geometry)
+        if len(points) < 3:
+            return None
+        yy, xx = np.mgrid[:shape[0], :shape[1]]
+        x = xx.astype(float) + 0.5
+        y = yy.astype(float) + 0.5
+        inside = np.zeros(shape, dtype=bool)
+        xj, yj = points[-1]
+        for xi, yi in points:
+            crosses = ((yi > y) != (yj > y)) & (
+                x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi
+            )
+            inside ^= crosses
+            xj, yj = xi, yi
+        return inside
+    return None
+
+
+def roi_geometry_bounds(
+    shape: tuple[int, int],
+    geometry: dict[str, Any] | None,
+) -> tuple[int, int, int, int] | None:
+    """Return inclusive pixel bounds for an area ROI geometry."""
+
+    mask = roi_geometry_mask(shape, geometry)
+    if mask is None or not mask.any():
+        return None
+    ys, xs = np.nonzero(mask)
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _points_from_geometry(geometry: dict[str, Any]) -> list[tuple[float, float]]:
+    raw = geometry.get("points_px") or geometry.get("points") or ()
+    points: list[tuple[float, float]] = []
+    for item in raw:
+        try:
+            points.append((float(item[0]), float(item[1])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return points
+
+
+def _clamped_rect(
+    shape: tuple[int, int],
+    rect,
+) -> tuple[int, int, int, int]:
+    try:
+        x0, y0, x1, y1 = [int(round(float(v))) for v in rect]
+    except (TypeError, ValueError):
+        raise ValueError("bad rect")
+    Ny, Nx = shape
+    x0 = max(0, min(Nx - 1, x0))
+    x1 = max(0, min(Nx - 1, x1))
+    y0 = max(0, min(Ny - 1, y0))
+    y1 = max(0, min(Ny - 1, y1))
+    if x1 < x0:
+        x0, x1 = x1, x0
+    if y1 < y0:
+        y0, y1 = y1, y0
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError("empty rect")
+    return x0, y0, x1, y1
+
+
 # ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -149,11 +247,14 @@ def apply_processing_state(arr: np.ndarray, state: ProcessingState) -> np.ndarra
         elif step.op == "align_rows":
             a = _proc.align_rows(a, method=p.get("method", "median"))
         elif step.op == "plane_bg":
+            fit_geometry = p.get("fit_geometry")
+            fit_mask = roi_geometry_mask(a.shape, fit_geometry) if fit_geometry else None
             a = _proc.subtract_background(
                 a,
                 order=int(p.get("order", 1)),
                 step_tolerance=bool(p.get("step_tolerance", False)),
                 fit_rect=p.get("fit_rect"),
+                fit_mask=fit_mask,
             )
         elif step.op == "stm_line_bg":
             a = _proc.stm_line_background(
@@ -200,20 +301,18 @@ def apply_processing_state(arr: np.ndarray, state: ProcessingState) -> np.ndarra
                 radius_px=float(p.get("radius_px", 3.0)),
             )
         elif step.op == "patch_interpolate":
-            rect = p.get("rect", ())
-            try:
-                x0, y0, x1, y1 = [int(v) for v in rect]
-            except (TypeError, ValueError):
+            geometry = p.get("geometry")
+            if geometry:
+                mask = roi_geometry_mask(a.shape, geometry)
+            else:
+                try:
+                    x0, y0, x1, y1 = _clamped_rect(a.shape, p.get("rect", ()))
+                except ValueError:
+                    continue
+                mask = np.zeros(a.shape, dtype=bool)
+                mask[y0:y1 + 1, x0:x1 + 1] = True
+            if mask is None or not mask.any():
                 continue
-            Ny, Nx = a.shape
-            x0 = max(0, min(Nx - 1, x0))
-            x1 = max(0, min(Nx - 1, x1))
-            y0 = max(0, min(Ny - 1, y0))
-            y1 = max(0, min(Ny - 1, y1))
-            if x1 <= x0 or y1 <= y0:
-                continue
-            mask = np.zeros(a.shape, dtype=bool)
-            mask[y0:y1 + 1, x0:x1 + 1] = True
             a = _proc.patch_interpolate(
                 a,
                 mask,
@@ -245,22 +344,27 @@ def apply_processing_state(arr: np.ndarray, state: ProcessingState) -> np.ndarra
                 continue
             if nested.op not in _ROI_ELIGIBLE_OPS:
                 continue
-            rect = p.get("rect", ())
-            try:
-                x0, y0, x1, y1 = [int(v) for v in rect]
-            except (TypeError, ValueError):
+            geometry = p.get("geometry")
+            if geometry:
+                mask = roi_geometry_mask(a.shape, geometry)
+                bounds = roi_geometry_bounds(a.shape, geometry)
+            else:
+                try:
+                    x0, y0, x1, y1 = _clamped_rect(a.shape, p.get("rect", ()))
+                except ValueError:
+                    continue
+                mask = np.zeros(a.shape, dtype=bool)
+                mask[y0:y1 + 1, x0:x1 + 1] = True
+                bounds = (x0, y0, x1, y1)
+            if mask is None or bounds is None or not mask.any():
                 continue
-            Ny, Nx = a.shape
-            x0 = max(0, min(Nx - 1, x0))
-            x1 = max(0, min(Nx - 1, x1))
-            y0 = max(0, min(Ny - 1, y0))
-            y1 = max(0, min(Ny - 1, y1))
-            if x1 <= x0 or y1 <= y0:
-                continue
+            x0, y0, x1, y1 = bounds
             crop = a[y0:y1 + 1, x0:x1 + 1]
             processed = apply_processing_state(crop, ProcessingState(steps=[nested]))
+            local_mask = mask[y0:y1 + 1, x0:x1 + 1]
             a = a.copy()
-            a[y0:y1 + 1, x0:x1 + 1] = processed
+            target = a[y0:y1 + 1, x0:x1 + 1]
+            target[local_mask] = processed[local_mask]
         else:
             raise ValueError(
                 f"Unknown processing operation {step.op!r}. "
