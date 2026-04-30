@@ -304,6 +304,67 @@ def test_zoom_label_endpoint_drag_updates_existing_selection(qapp):
     }
 
 
+def test_zoom_label_line_nudge_moves_one_image_pixel_and_emits(qapp):
+    from probeflow.gui_viewer_widgets import _ZoomLabel
+
+    label = _ZoomLabel()
+    label.resize(200, 100)
+    label._selection_geometry = {
+        "kind": "line",
+        "points_frac": [(0.25, 0.50), (0.75, 0.50)],
+    }
+    previews = []
+    commits = []
+    label.selection_preview_changed.connect(lambda geometry: previews.append(geometry))
+    label.selection_changed.connect(lambda geometry: commits.append(geometry))
+
+    moved = label.nudge_line(1, -1, (101, 201))
+
+    assert moved is True
+    assert previews and commits
+    points = label.current_selection()["points_frac"]
+    np.testing.assert_allclose(points, [(0.255, 0.49), (0.755, 0.49)])
+
+
+def test_viewer_line_profile_uses_display_array_and_physical_units(qapp):
+    from probeflow.gui import ImageViewerDialog
+
+    class FakePanel:
+        def __init__(self):
+            self.empty = None
+            self.profile = None
+
+        def show_empty(self, message="Draw a line to show profile.", theme=None):
+            self.empty = message
+
+        def plot_profile(self, distance_nm, values, *, y_label, theme=None):
+            self.profile = (np.asarray(distance_nm), np.asarray(values), y_label)
+
+    class FakeZoom:
+        def selection_tool(self):
+            return "line"
+
+    dlg = ImageViewerDialog.__new__(ImageViewerDialog)
+    dlg._line_profile_panel = FakePanel()
+    dlg._zoom_lbl = FakeZoom()
+    dlg._display_arr = np.tile(np.arange(5, dtype=np.float64), (5, 1))
+    dlg._raw_arr = None
+    dlg._scan_range_m = (5e-9, 5e-9)
+    dlg._t = {}
+    dlg._current_array_shape = lambda: dlg._display_arr.shape
+    dlg._channel_unit = lambda: (1.0, "V", "Test channel")
+
+    dlg._refresh_line_profile({
+        "kind": "line",
+        "points_px": [(0, 2), (4, 2)],
+    })
+
+    distance_nm, values, y_label = dlg._line_profile_panel.profile
+    np.testing.assert_allclose(distance_nm, np.linspace(0.0, 4.0, 5))
+    np.testing.assert_allclose(values, np.arange(5, dtype=np.float64))
+    assert y_label == "Test channel [V]"
+
+
 def test_viewer_dialog_initializes_panel_from_thumbnail_processing(qapp, monkeypatch):
     from probeflow.gui import ImageViewerDialog, ProcessingControlPanel, SxmFile
 

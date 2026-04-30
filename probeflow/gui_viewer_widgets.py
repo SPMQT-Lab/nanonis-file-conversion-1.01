@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from typing import Optional
 
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
 from PySide6.QtCore import Qt, QPointF, QRect, Signal
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QPainter, QPen, QPixmap, QPolygonF, QWheelEvent,
 )
-from PySide6.QtWidgets import QLabel, QToolTip, QWidget
+from PySide6.QtWidgets import QLabel, QToolTip, QVBoxLayout, QWidget
 
 # ── Physical-axis ruler (top / left of the image) ───────────────────────────
 class RulerWidget(QWidget):
@@ -214,12 +216,67 @@ class ScaleBarWidget(QWidget):
         painter.end()
 
 
+class LineProfilePanel(QWidget):
+    """Compact live profile plot for viewer line selections."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 0)
+        lay.setSpacing(0)
+        self._fig = Figure(figsize=(5.0, 1.8), dpi=80)
+        self._fig.patch.set_alpha(0)
+        self._ax = self._fig.add_subplot(111)
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._canvas.setFixedHeight(150)
+        lay.addWidget(self._canvas)
+        self.show_empty()
+
+    def show_empty(self, message: str = "Draw a line to show profile.",
+                   theme: Optional[dict] = None) -> None:
+        theme = theme or {}
+        bg = theme.get("bg", "#1e1e2e")
+        fg = theme.get("fg", "#cdd6f4")
+        sep = theme.get("sep", "#45475a")
+        self._fig.patch.set_facecolor(bg)
+        self._ax.cla()
+        self._ax.set_facecolor(bg)
+        self._ax.text(0.5, 0.5, message, ha="center", va="center",
+                      transform=self._ax.transAxes, color=fg, fontsize=9)
+        self._ax.set_xticks([])
+        self._ax.set_yticks([])
+        for spine in self._ax.spines.values():
+            spine.set_edgecolor(sep)
+        self._fig.tight_layout(pad=0.35)
+        self._canvas.draw_idle()
+
+    def plot_profile(self, distance_nm, values, *, y_label: str,
+                     theme: Optional[dict] = None) -> None:
+        theme = theme or {}
+        bg = theme.get("bg", "#1e1e2e")
+        fg = theme.get("fg", "#cdd6f4")
+        sep = theme.get("sep", "#45475a")
+        accent = theme.get("accent_bg", "#89b4fa")
+        self._fig.patch.set_facecolor(bg)
+        self._ax.cla()
+        self._ax.set_facecolor(bg)
+        self._ax.plot(distance_nm, values, color=accent, linewidth=1.1)
+        self._ax.set_xlabel("Distance [nm]", fontsize=8, color=fg)
+        self._ax.set_ylabel(y_label, fontsize=8, color=fg)
+        self._ax.tick_params(colors=fg, labelsize=7)
+        for spine in self._ax.spines.values():
+            spine.set_edgecolor(sep)
+        self._fig.tight_layout(pad=0.35)
+        self._canvas.draw_idle()
+
+
 # ── Full-size image viewer dialog ─────────────────────────────────────────────
 class _ZoomLabel(QLabel):
     """QLabel inside a scroll area that supports Ctrl+Wheel zoom and spec-position markers."""
 
     marker_clicked = Signal(object)  # emits VertFile when user clicks a marker
     pixel_clicked  = Signal(float, float)  # (frac_x, frac_y) — only when set_zero_mode is on
+    selection_preview_changed = Signal(object)  # structured ROI geometry while dragging
     selection_changed = Signal(object)  # structured ROI geometry
     pixmap_resized = Signal(int)  # new pixmap width in pixels (zoom changes, source changes)
 
@@ -255,6 +312,48 @@ class _ZoomLabel(QLabel):
         self._polygon_points = []
         self.update()
         self._update_cursor()
+
+    def selection_tool(self) -> str:
+        return self._selection_tool
+
+    def current_selection(self):
+        return dict(self._selection_geometry) if self._selection_geometry else None
+
+    def nudge_line(self, dx_px: int, dy_px: int,
+                   image_shape: tuple[int, int] | None) -> bool:
+        """Move the active line ROI by whole image pixels, preserving length."""
+        if not self._selection_geometry or self._selection_geometry.get("kind") != "line":
+            return False
+        if image_shape is None:
+            return False
+        try:
+            Ny, Nx = int(image_shape[0]), int(image_shape[1])
+        except (TypeError, ValueError, IndexError):
+            return False
+        if Ny <= 1 or Nx <= 1:
+            return False
+        points = list(self._selection_geometry.get("points_frac") or [])
+        if len(points) < 2:
+            return False
+        dfx = float(dx_px) / float(max(1, Nx - 1))
+        dfy = float(dy_px) / float(max(1, Ny - 1))
+        xs = [float(p[0]) for p in points[:2]]
+        ys = [float(p[1]) for p in points[:2]]
+        dfx = max(-min(xs), min(dfx, 1.0 - max(xs)))
+        dfy = max(-min(ys), min(dfy, 1.0 - max(ys)))
+        if abs(dfx) < 1e-15 and abs(dfy) < 1e-15:
+            return False
+        moved = [
+            (max(0.0, min(1.0, x + dfx)), max(0.0, min(1.0, y + dfy)))
+            for x, y in zip(xs, ys)
+        ]
+        geometry = {"kind": "line", "points_frac": moved}
+        self._selection_geometry = geometry
+        self._selection_drag = None
+        self.selection_preview_changed.emit(dict(geometry))
+        self.selection_changed.emit(dict(geometry))
+        self.update()
+        return True
 
     def clear_roi(self):
         self._selection_start = None
@@ -547,6 +646,8 @@ class _ZoomLabel(QLabel):
             )
             if geometry is not None:
                 self._selection_drag = geometry
+                if geometry.get("kind") == "line":
+                    self.selection_preview_changed.emit(dict(geometry))
                 self.update()
             return
         if (
@@ -561,6 +662,8 @@ class _ZoomLabel(QLabel):
                 (fx1, fy1),
                 event.modifiers(),
             )
+            if self._selection_tool == "line" and self._selection_drag is not None:
+                self.selection_preview_changed.emit(dict(self._selection_drag))
             self.update()
             return
         if self._show_markers and self._markers and self._pixmap_orig is not None:
