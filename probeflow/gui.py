@@ -4048,6 +4048,14 @@ class DeveloperTerminalWidget(QWidget):
         self._pane.clear()
         self._set_cwd(self._cwd)
 
+    # Tools that require a real PTY — intercept and open external terminal.
+    _PTY_TOOLS = frozenset({
+        "claude", "ipython", "ipython3",
+        "vim", "vi", "nvim", "nano", "emacs",
+        "htop", "top", "btop", "less", "more", "man",
+        "ssh", "sftp", "ftp", "telnet",
+    })
+
     def _run_command(self, cmd: str):
         if not cmd:
             self._pane.show_prompt()
@@ -4056,6 +4064,18 @@ class DeveloperTerminalWidget(QWidget):
             self._pane.append_error("[busy — press Ctrl+C to interrupt]\n")
             self._pane.show_prompt()
             return
+
+        # Detect interactive tools that need a real PTY
+        first = cmd.split()[0].lstrip("./") if cmd.split() else ""
+        # plain `python` / `python3` with no args also needs a PTY
+        is_bare_python = first in ("python", "python3", "python3.x") and len(cmd.split()) == 1
+        if first in self._PTY_TOOLS or is_bare_python:
+            self._pane.append_output(
+                f"['{first}' needs an interactive terminal — opening external terminal…]\n")
+            self._pane.show_prompt()
+            self._open_external()
+            return
+
         import shutil
         if sys.platform.startswith("win"):
             shell, args = "cmd.exe", ["/c", cmd]
