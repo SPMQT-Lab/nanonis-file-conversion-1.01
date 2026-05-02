@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+# Layout cleanup note: this module is a compatibility parking area while the
+# remaining Qt classes are moved into dedicated gui/* modules. New parser,
+# writer, processing, analysis, plugin, and graph-node code belongs elsewhere.
+
 import io
 import json
 import re as _re
@@ -72,16 +76,16 @@ from probeflow.display import (
 )
 from probeflow.display_state import DisplayRangeState
 from probeflow.export_provenance import build_scan_export_provenance, png_display_state
-from probeflow.gui_processing import (
+from probeflow.processing.gui_adapter import (
     processing_state_from_gui,
 )
-from probeflow.gui_features import (
+from probeflow.gui.features import (
     FeaturesPanel,
     FeaturesSidebar,
     _FeaturesWorker,
     _FeaturesWorkerSignals,
 )
-from probeflow.gui_tv import (
+from probeflow.gui.features.tv import (
     TVPanel,
     TVSidebar,
     _TVWorker,
@@ -91,7 +95,7 @@ from probeflow.scan import SUPPORTED_SUFFIXES, load_scan
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 CONFIG_PATH     = Path.home() / ".probeflow_config.json"
-REPO_ROOT       = Path(__file__).resolve().parent.parent
+REPO_ROOT       = Path(__file__).resolve().parents[2]
 DEFAULT_CUSHION = REPO_ROOT / "src" / "file_cushions"
 LOGO_PATH       = REPO_ROOT / "assets" / "logo.png"
 LOGO_GIF_PATH   = REPO_ROOT / "assets" / "logo.gif"
@@ -169,7 +173,7 @@ THEMES = {
 }
 
 # ── Extracted GUI helpers (re-exported for compatibility) ─────────────────────
-from probeflow.gui_models import (
+from probeflow.gui.models import (
     PLANE_NAMES,
     SxmFile,
     VertFile,
@@ -179,7 +183,7 @@ from probeflow.gui_models import (
     scan_image_folder,
     scan_vert_folder,
 )
-from probeflow.gui_rendering import (
+from probeflow.gui.rendering import (
     CMAP_KEY,
     CMAP_NAMES,
     DEFAULT_CMAP_KEY,
@@ -199,7 +203,7 @@ from probeflow.gui_rendering import (
     render_with_processing,
     resolve_thumbnail_plane_index,
 )
-from probeflow.gui_workers import (
+from probeflow.gui.workers import (
     ChannelLoader,
     ChannelSignals,
     ConversionSignals,
@@ -209,8 +213,8 @@ from probeflow.gui_workers import (
     ViewerLoader,
     ViewerSignals,
 )
-from probeflow.gui_browse import ScanCard, SpecCard, ThumbnailGrid, _BrowseCard
-from probeflow.gui_viewer_widgets import (
+from probeflow.gui.browse import ScanCard, SpecCard, ThumbnailGrid, _BrowseCard
+from probeflow.gui.viewer.widgets import (
     LineProfilePanel,
     RulerWidget,
     ScaleBarWidget,
@@ -3261,7 +3265,7 @@ class BrowseInfoPanel(QWidget):
         self._load_vert_metadata(entry)
 
     def _load_vert_metadata(self, entry: VertFile):
-        from .spec_io import parse_spec_header
+        from probeflow.spec_io import parse_spec_header
         try:
             hdr = parse_spec_header(entry.path)
         except Exception:
@@ -3415,7 +3419,7 @@ class BrowseInfoPanel(QWidget):
 
 
 # ── Features tab integration ────────────────────────────────────────────────
-# Specialized add-on workflows live in probeflow.gui_features.  Keep this main
+# Specialized add-on workflows live in probeflow.gui.features. Keep this main
 # GUI file focused on Browse/Viewer/Convert orchestration; Features owns tools
 # like particle counting, template counting, lattice extraction, and future
 # TV-denoise/background-removal panels so optional analysis dependencies do not
@@ -3571,7 +3575,7 @@ class SpecViewerDialog(QDialog):
     # ── Data load + channel list population ─────────────────────────────
 
     def _load(self) -> None:
-        from .spec_io import read_spec_file
+        from probeflow.spec_io import read_spec_file
 
         try:
             spec = read_spec_file(self._entry.path)
@@ -3621,7 +3625,7 @@ class SpecViewerDialog(QDialog):
     def _display_values_for_channel(self, ch: str) -> tuple[np.ndarray, str]:
         if self._spec is None or ch not in self._spec.channels:
             return np.array([], dtype=float), ""
-        from .spec_plot import choose_display_unit, lookup_unit_scale
+        from probeflow.spec_plot import choose_display_unit, lookup_unit_scale
 
         y = np.asarray(self._spec.channels[ch], dtype=float)
         unit = self._spec.y_units.get(ch, "")
@@ -3759,7 +3763,7 @@ class SpecViewerDialog(QDialog):
         if not out_dir:
             return
         try:
-            from .xmgrace_export import Curve, export_bundle
+            from probeflow.xmgrace_export import Curve, export_bundle
         except ImportError as exc:
             self._status.setText(f"xmgrace export unavailable: {exc}")
             return

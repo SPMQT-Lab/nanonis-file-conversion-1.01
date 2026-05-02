@@ -1,0 +1,37 @@
+"""Compatibility location for CLI processing operation helpers."""
+
+from probeflow.cli._legacy import (
+    _Op,
+    _apply_to_plane,
+    _cli_png_provenance,
+    _derive_output,
+    _op_align_rows,
+    _op_edge,
+    _op_facet_level,
+    _op_fft,
+    _op_plane_bg,
+    _op_remove_bad_lines,
+    _op_smooth,
+    _parse_processing_steps,
+    _processing_state_from_ops,
+    _record_op,
+    _write_output,
+)
+
+__all__ = [
+    "_Op",
+    "_apply_to_plane",
+    "_cli_png_provenance",
+    "_derive_output",
+    "_op_align_rows",
+    "_op_edge",
+    "_op_facet_level",
+    "_op_fft",
+    "_op_plane_bg",
+    "_op_remove_bad_lines",
+    "_op_smooth",
+    "_parse_processing_steps",
+    "_processing_state_from_ops",
+    "_record_op",
+    "_write_output",
+]

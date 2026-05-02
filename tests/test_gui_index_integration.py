@@ -15,6 +15,8 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+pytest.importorskip("PySide6")
+
 from probeflow.indexing import (
     ProbeFlowItem,
     image_browser_items,

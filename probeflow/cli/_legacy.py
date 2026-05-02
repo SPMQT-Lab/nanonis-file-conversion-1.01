@@ -38,6 +38,11 @@ Run ``probeflow <command> --help`` for the options of any subcommand.
 
 from __future__ import annotations
 
+# Layout cleanup note: this module preserves current CLI behaviour while command
+# runners and parser helpers are moved into cli/commands, parser.py, and
+# processing_ops.py. New domain models, graph nodes, GUI widgets, and numerical
+# kernels belong in their canonical packages.
+
 import argparse
 import json
 import logging
@@ -50,7 +55,7 @@ from PIL import Image
 
 from probeflow import processing as _proc
 from probeflow.common import setup_logging
-from probeflow.gui_processing import processing_history_entries_from_state
+from probeflow.processing.gui_adapter import processing_history_entries_from_state
 from probeflow.processing_state import ProcessingState, ProcessingStep
 from probeflow.scan import load_scan
 from probeflow.scan_model import Scan
@@ -524,7 +529,7 @@ def _cmd_prepare_png(args) -> int:
 
     state = _processing_state_from_ops(ops)
     if state.steps:
-        from probeflow.gui_processing import processing_history_entries_from_state
+        from probeflow.processing.gui_adapter import processing_history_entries_from_state
         from probeflow.processing_state import apply_processing_state
         scan.planes[args.plane] = apply_processing_state(scan.planes[args.plane], state)
         scan.processing_history.extend(processing_history_entries_from_state(state))

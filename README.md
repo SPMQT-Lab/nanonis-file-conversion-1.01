@@ -429,29 +429,21 @@ dzdv = numeric_derivative(spec.x_array, z_smooth)
 
 ```
 probeflow/              # installable package
-├── __init__.py
-├── scan.py             # Scan dataclass + load_scan dispatcher (main entry point)
-├── file_type.py        # content-sniffing file-type classifier
-├── indexing.py         # lightweight folder indexing into ProbeFlowItem records
-├── validation.py       # Scan validation before GUI/export use
-├── display.py          # shared clipping, normalisation, histogram, RGBA/uint8 rendering
-├── display_state.py    # percentile/manual display-range state
-├── processing_state.py # canonical processing step/state objects
-├── export_provenance.py # provenance records for exported outputs
-├── readers/            # scan readers (sxm, dat) + nanonis_spec spectroscopy reader
-├── writers/            # output formats (sxm, png, pdf, csv, json)
-├── processing.py       # image-processing pipeline (GUI-free) — incl. tv_denoise, line_profile
-├── features.py         # particle segmentation / template counting / few-shot classify (GUI-free)
-├── lattice.py          # SIFT lattice extraction + unit-cell averaging (GUI-free)
-├── spec_io.py          # Createc .VERT reader → SpecData (GUI-free)
-├── spec_processing.py  # spectroscopy processing functions (GUI-free)
-├── spec_plot.py        # spectroscopy matplotlib plots (GUI-free)
-├── sxm_io.py           # low-level .sxm byte layout (used by readers/writers)
-├── common.py           # DAC / header utilities shared by Createc / Nanonis paths
-├── dat_sxm.py          # Createc .dat → Nanonis .sxm (legacy CLI: `dat-sxm`)
-├── dat_png.py          # Createc .dat → PNG previews (legacy CLI: `dat-png`)
-├── gui.py              # PySide6 desktop interface (Browse / Convert / Features tabs)
-└── cli.py              # unified "probeflow" command
+|-- __init__.py
+|-- core/               # Scan model/loading, metadata, indexing, validation
+|-- io/                 # file sniffing, readers, writers, .sxm layout, converters
+|-- processing/         # GUI-free image/display/spectroscopy processing
+|-- analysis/           # particles, lattice, spectroscopy plotting, xmgrace export
+|-- provenance/         # export provenance now; graph provenance later
+|-- gui/                # PySide6 GUI package and future panel/dialog subpackages
+|-- cli/                # unified "probeflow" command package
+|-- plugins/            # future plugin API, registry, manifests, adapters
+|-- scan.py             # compatibility shim for core.scan_loader
+|-- processing_state.py # compatibility shim for processing.state
+|-- readers/            # compatibility shims for io.readers
+|-- writers/            # compatibility shims for io.writers
+|-- dat_sxm.py          # compatibility shim for io.converters.createc_dat_to_sxm
+`-- dat_png.py          # compatibility shim for io.converters.createc_dat_to_png
 
 src/file_cushions/      # binary layout captured from a reference .sxm file
 data/                   # sample input / output for manual runs + tests
