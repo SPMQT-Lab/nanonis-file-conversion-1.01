@@ -42,7 +42,7 @@ def test_browse_quick_panel_emits_only_thumbnail_corrections(qapp):
         "fft_mode": "high_pass",
     })
 
-    assert panel.state() == {"align_rows": "median"}
+    assert panel.state() == {"align_rows": "median", "remove_bad_lines": None}
 
 
 def test_viewer_full_panel_round_trips_standard_processing_state(qapp):

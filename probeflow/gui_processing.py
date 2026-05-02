@@ -32,6 +32,7 @@ NUMERIC_PROC_KEYS: tuple[str, ...] = (
     "periodic_notch_radius",
     "patch_interpolate_rect",
     "patch_interpolate_geometry",
+    "patch_interpolate_method",
     "patch_interpolate_iterations",
     "linear_undistort",
     "set_zero_xy",
@@ -86,8 +87,15 @@ def processing_state_from_gui(gui_state: dict) -> "ProcessingState":
         else:
             steps.append(step)
 
-    if gui_state.get("remove_bad_lines"):
-        _append_step(ProcessingStep("remove_bad_lines", {"threshold_mad": 5.0}))
+    bad_lines_method = gui_state.get("remove_bad_lines")
+    if bad_lines_method:
+        # Legacy boolean True maps to the original MAD method.
+        if bad_lines_method is True or bad_lines_method == "True":
+            bad_lines_method = "mad"
+        _append_step(ProcessingStep("remove_bad_lines", {
+            "threshold_mad": 5.0,
+            "method": str(bad_lines_method),
+        }))
 
     align = gui_state.get("align_rows")
     if align:
@@ -141,6 +149,7 @@ def processing_state_from_gui(gui_state: dict) -> "ProcessingState":
     if _area_geometry(patch_geometry):
         params = {
             "geometry": dict(patch_geometry),
+            "method": str(gui_state.get("patch_interpolate_method", "line_fit")),
             "iterations": int(gui_state.get("patch_interpolate_iterations", 200)),
         }
         if patch_geometry.get("kind") == "rectangle":
@@ -159,6 +168,7 @@ def processing_state_from_gui(gui_state: dict) -> "ProcessingState":
         if len(patch_rect_tuple) == 4:
             _append_step(ProcessingStep("patch_interpolate", {
                 "rect": patch_rect_tuple,
+                "method": str(gui_state.get("patch_interpolate_method", "line_fit")),
                 "iterations": int(gui_state.get("patch_interpolate_iterations", 200)),
             }))
 

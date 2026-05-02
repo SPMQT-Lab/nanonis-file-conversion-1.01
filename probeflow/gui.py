@@ -262,7 +262,7 @@ def save_config(cfg: dict) -> None:
 class ProcessingControlPanel(QWidget):
     """Internal processing controls shared by Browse and Viewer."""
 
-    QUICK_KEYS = ("align_rows",)
+    QUICK_KEYS = ("align_rows", "remove_bad_lines")
 
     def __init__(self, mode: str, parent=None):
         super().__init__(parent)
@@ -316,6 +316,14 @@ class ProcessingControlPanel(QWidget):
         lay.addWidget(line_lbl)
 
         self._align_combo = _combo_row("Align rows:", ["None", "Median", "Mean"])
+
+        self._bad_lines_combo = _combo_row(
+            "Bad lines:", ["None", "MAD (rows)", "Step (cols)"]
+        )
+        self._bad_lines_combo.setToolTip(
+            "MAD: flags rows whose median deviates by >5× MAD from the image median.\n"
+            "Step: per-column scan for large vertical jumps; detects partial bad lines."
+        )
 
         if self._mode == "browse_quick":
             lay.addStretch()
@@ -406,8 +414,10 @@ class ProcessingControlPanel(QWidget):
 
     def state(self) -> dict:
         align_map = {0: None, 1: "median", 2: "mean"}
+        bad_map = {0: None, 1: "mad", 2: "step"}
         cfg = {
             "align_rows": align_map[self._align_combo.currentIndex()],
+            "remove_bad_lines": bad_map[self._bad_lines_combo.currentIndex()],
         }
         if self._mode == "browse_quick":
             return {k: cfg[k] for k in self.QUICK_KEYS}
@@ -447,6 +457,8 @@ class ProcessingControlPanel(QWidget):
         state = state or {}
         self._align_combo.setCurrentIndex(
             {None: 0, "median": 1, "mean": 2}.get(state.get("align_rows"), 0))
+        self._bad_lines_combo.setCurrentIndex(
+            {None: 0, "mad": 1, "step": 2}.get(state.get("remove_bad_lines"), 0))
         if self._mode == "browse_quick":
             return
 
@@ -929,10 +941,25 @@ class ImageViewerDialog(QDialog):
         self._patch_roi_cb = QCheckBox("Patch-interpolate selection")
         self._patch_roi_cb.setFont(QFont("Helvetica", 8))
         self._patch_roi_cb.setToolTip(
-            "Fills the selected area by Laplace patch interpolation. "
+            "Fills the selected area by patch interpolation. "
             "Line selections cannot be patch-interpolated."
         )
         right_lay.addWidget(self._patch_roi_cb)
+
+        patch_method_row = QHBoxLayout()
+        patch_method_lbl = QLabel("  Method:")
+        patch_method_lbl.setFont(QFont("Helvetica", 8))
+        patch_method_lbl.setFixedWidth(56)
+        self._patch_method_combo = QComboBox()
+        self._patch_method_combo.addItems(["Line-fit (slope)", "Laplace (smooth)"])
+        self._patch_method_combo.setFont(QFont("Helvetica", 8))
+        self._patch_method_combo.setToolTip(
+            "Line-fit: extrapolates scan-line slope from rim pixels — recommended for STM terraces.\n"
+            "Laplace: isotropic harmonic fill — smooth but does not preserve surface tilt."
+        )
+        patch_method_row.addWidget(patch_method_lbl)
+        patch_method_row.addWidget(self._patch_method_combo, 1)
+        right_lay.addLayout(patch_method_row)
 
         self._roi_status_lbl = QLabel("Selection: none")
         self._roi_status_lbl.setFont(QFont("Helvetica", 8))
@@ -2048,6 +2075,9 @@ class ImageViewerDialog(QDialog):
             else:
                 self._processing.pop("patch_interpolate_rect", None)
             self._processing["patch_interpolate_iterations"] = 200
+            self._processing["patch_interpolate_method"] = (
+                "line_fit" if self._patch_method_combo.currentIndex() == 0 else "laplace"
+            )
         else:
             self._processing.pop("patch_interpolate_rect", None)
             self._processing.pop("patch_interpolate_geometry", None)

@@ -314,6 +314,7 @@ class TestGuiConversion:
         assert state.steps[0].op == "patch_interpolate"
         assert state.steps[0].params == {
             "rect": (3, 4, 8, 9),
+            "method": "line_fit",
             "iterations": 50,
         }
 
@@ -330,6 +331,7 @@ class TestGuiConversion:
         assert state.steps[0].op == "patch_interpolate"
         assert state.steps[0].params == {
             "geometry": geometry,
+            "method": "line_fit",
             "iterations": 50,
         }
 
@@ -550,7 +552,7 @@ class TestApplyKnownSteps:
     def test_remove_bad_lines_threshold_is_forwarded(self, monkeypatch):
         captured = {}
 
-        def fake_remove_bad_lines(arr, threshold_mad=5.0):
+        def fake_remove_bad_lines(arr, threshold_mad=5.0, *, method="mad"):
             captured["threshold_mad"] = threshold_mad
             return arr
 
