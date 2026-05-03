@@ -587,8 +587,11 @@ class FFTViewerDialog(QDialog):
         self._fft_ylim: tuple = (1.0, 0.0)
         self._scale_mode = "log"
         self._window_mode = "hann"
-        self._dc_mode = "zero"
+        self._dc_mode = "keep"
         self._pan_anchor: tuple | None = None
+        self._disp_range: tuple = (0.0, 1.0)
+        self._vmin_frac: float = 0.0
+        self._vmax_frac: float = 1.0
 
         self._build()
         self._recompute_fft()
@@ -613,39 +616,42 @@ class FFTViewerDialog(QDialog):
             lb.setFont(QFont("Helvetica", 8))
             return lb
 
-        def _combo(items):
+        def _combo(items, min_width=80):
             c = QComboBox()
             c.addItems(items)
             c.setFont(QFont("Helvetica", 8))
             c.setFixedHeight(22)
+            c.setMinimumWidth(min_width)
             return c
 
         tb.addWidget(_lbl("Scale:"))
-        self._scale_combo = _combo(["Log", "Linear"])
+        self._scale_combo = _combo(["Log", "Linear"], 72)
         self._scale_combo.currentIndexChanged.connect(self._on_scale_changed)
         tb.addWidget(self._scale_combo)
 
         tb.addWidget(_lbl("Window:"))
-        self._window_combo = _combo(["Hann", "None", "Tukey"])
+        self._window_combo = _combo(["Hann", "None", "Tukey"], 76)
         self._window_combo.currentIndexChanged.connect(self._on_window_changed)
         tb.addWidget(self._window_combo)
 
         tb.addWidget(_lbl("DC:"))
-        self._dc_combo = _combo(["Zero DC", "Keep DC", "Mask DC"])
+        self._dc_combo = _combo(["Zero DC", "Keep DC", "Mask DC"], 88)
+        self._dc_combo.setCurrentIndex(1)  # default: Keep DC — show full data
         self._dc_combo.currentIndexChanged.connect(self._on_dc_changed)
         tb.addWidget(self._dc_combo)
 
         tb.addStretch(1)
 
-        for label, slot in [
-            ("Fit",  self._zoom_fit),
-            ("⌂",   self._zoom_centre),
-            ("+",   lambda: self._zoom_by(0.5)),
-            ("−",   lambda: self._zoom_by(2.0)),
+        for label, tip, slot in [
+            ("Fit", "Zoom to fit full FFT extent",    self._zoom_fit),
+            ("Ctr", "Zoom to centre (quarter range)", self._zoom_centre),
+            ("+",   "Zoom in",                        lambda: self._zoom_by(0.5)),
+            ("-",   "Zoom out",                       lambda: self._zoom_by(2.0)),
         ]:
             btn = QPushButton(label)
             btn.setFont(QFont("Helvetica", 8))
             btn.setFixedSize(28, 22)
+            btn.setToolTip(tip)
             btn.clicked.connect(slot)
             tb.addWidget(btn)
 
@@ -658,7 +664,7 @@ class FFTViewerDialog(QDialog):
 
         lay.addLayout(tb)
 
-        # figure
+        # main figure
         self._fig = Figure(figsize=(10.0, 4.8), dpi=90)
         self._fig.patch.set_facecolor(bg)
         self._canvas = FigureCanvasQTAgg(self._fig)
@@ -673,6 +679,59 @@ class FFTViewerDialog(QDialog):
             ax.tick_params(colors=fg, labelsize=7)
 
         self._fig.subplots_adjust(left=0.07, right=0.97, top=0.95, bottom=0.10, wspace=0.30)
+
+        # intensity histogram panel
+        hist_row = QHBoxLayout()
+        hist_row.setSpacing(10)
+        hist_row.setContentsMargins(0, 2, 0, 2)
+
+        self._hist_fig = Figure(figsize=(2.8, 0.72), dpi=90)
+        self._hist_fig.patch.set_facecolor(bg)
+        self._hist_canvas = FigureCanvasQTAgg(self._hist_fig)
+        self._hist_canvas.setFixedHeight(72)
+        self._hist_canvas.setFixedWidth(250)
+        self._hist_ax = self._hist_fig.add_axes([0.04, 0.22, 0.93, 0.70])
+        self._hist_ax.set_facecolor(bg)
+        hist_row.addWidget(self._hist_canvas)
+
+        slider_col = QVBoxLayout()
+        slider_col.setSpacing(3)
+
+        def _intensity_row(label_text):
+            row = QHBoxLayout()
+            lbl = QLabel(label_text)
+            lbl.setFont(QFont("Helvetica", 8))
+            lbl.setFixedWidth(28)
+            sl = QSlider(Qt.Horizontal)
+            sl.setRange(0, 1000)
+            sl.setFixedHeight(16)
+            val_lbl = QLabel("")
+            val_lbl.setFont(QFont("Helvetica", 8))
+            val_lbl.setFixedWidth(60)
+            row.addWidget(lbl)
+            row.addWidget(sl, 1)
+            row.addWidget(val_lbl)
+            return row, sl, val_lbl
+
+        min_row, self._vmin_slider, self._vmin_val_lbl = _intensity_row("Min:")
+        self._vmin_slider.setValue(0)
+        self._vmin_slider.valueChanged.connect(self._on_vmin_changed)
+        slider_col.addLayout(min_row)
+
+        max_row, self._vmax_slider, self._vmax_val_lbl = _intensity_row("Max:")
+        self._vmax_slider.setValue(1000)
+        self._vmax_slider.valueChanged.connect(self._on_vmax_changed)
+        slider_col.addLayout(max_row)
+
+        reset_intensity_btn = QPushButton("Reset")
+        reset_intensity_btn.setFont(QFont("Helvetica", 8))
+        reset_intensity_btn.setFixedHeight(18)
+        reset_intensity_btn.setToolTip("Reset intensity to full range")
+        reset_intensity_btn.clicked.connect(self._reset_intensity)
+        slider_col.addWidget(reset_intensity_btn)
+
+        hist_row.addLayout(slider_col, 1)
+        lay.addLayout(hist_row)
 
         # status bar
         self._status_lbl = QLabel("")
@@ -743,6 +802,10 @@ class FFTViewerDialog(QDialog):
             mag[y0:y1, x0:x1] = np.nan
         if self._scale_mode == "log":
             mag = np.log1p(mag)
+        finite = mag[np.isfinite(mag)]
+        self._disp_range = (
+            (float(finite.min()), float(finite.max())) if finite.size > 0 else (0.0, 1.0)
+        )
         return mag
 
     # ── drawing ────────────────────────────────────────────────────────────────
@@ -774,6 +837,9 @@ class FFTViewerDialog(QDialog):
         ax.cla()
         ax.set_facecolor(bg)
         disp = self._compute_display_fft()
+        lo, hi = self._disp_range
+        vmin_val = lo + self._vmin_frac * (hi - lo)
+        vmax_val = lo + self._vmax_frac * (hi - lo)
         extent_q = [
             float(self._qx[0]), float(self._qx[-1]),
             float(self._qy[-1]), float(self._qy[0]),
@@ -781,6 +847,7 @@ class FFTViewerDialog(QDialog):
         ax.imshow(
             disp, cmap="inferno", origin="upper",
             extent=extent_q, aspect="equal",
+            vmin=vmin_val, vmax=vmax_val,
         )
         ax.set_xlim(*self._fft_xlim)
         ax.set_ylim(*self._fft_ylim)
@@ -794,6 +861,8 @@ class FFTViewerDialog(QDialog):
         ax.axhline(0, color=fg, lw=0.4, alpha=0.35)
         ax.axvline(0, color=fg, lw=0.4, alpha=0.35)
 
+        self._update_histogram(disp)
+        self._sync_intensity_labels()
         self._canvas.draw_idle()
 
     # ── zoom / pan ─────────────────────────────────────────────────────────────
@@ -887,6 +956,65 @@ class FFTViewerDialog(QDialog):
 
     def _on_dc_changed(self, idx: int):
         self._dc_mode = ["zero", "keep", "mask"][idx]
+        self._redraw()
+
+    def _update_histogram(self, disp: np.ndarray):
+        fg = self._theme.get("fg", "#dddddd")
+        bg = self._theme.get("bg", "#1e1e1e")
+        ax = self._hist_ax
+        ax.cla()
+        ax.set_facecolor(bg)
+        finite = disp[np.isfinite(disp)]
+        if finite.size > 0:
+            lo, hi = self._disp_range
+            ax.hist(finite.ravel(), bins=200, range=(lo, hi),
+                    color="#7799cc", alpha=0.85, linewidth=0)
+            vmin_val = lo + self._vmin_frac * (hi - lo)
+            vmax_val = lo + self._vmax_frac * (hi - lo)
+            ax.axvline(vmin_val, color="#ff6666", lw=1.2)
+            ax.axvline(vmax_val, color="#66ff88", lw=1.2)
+            ax.set_xlim(lo, hi)
+        ax.set_yticks([])
+        ax.tick_params(colors=fg, labelsize=6, length=2)
+        for spine in ax.spines.values():
+            spine.set_color(fg)
+        self._hist_fig.tight_layout(pad=0.1)
+        self._hist_canvas.draw_idle()
+
+    def _sync_intensity_labels(self):
+        lo, hi = self._disp_range
+        self._vmin_val_lbl.setText(f"{lo + self._vmin_frac * (hi - lo):.3g}")
+        self._vmax_val_lbl.setText(f"{lo + self._vmax_frac * (hi - lo):.3g}")
+
+    def _on_vmin_changed(self, val: int):
+        new_frac = val / 1000.0
+        if new_frac > self._vmax_frac:
+            new_frac = self._vmax_frac
+            self._vmin_slider.blockSignals(True)
+            self._vmin_slider.setValue(int(self._vmax_frac * 1000))
+            self._vmin_slider.blockSignals(False)
+        self._vmin_frac = new_frac
+        self._redraw()
+
+    def _on_vmax_changed(self, val: int):
+        new_frac = val / 1000.0
+        if new_frac < self._vmin_frac:
+            new_frac = self._vmin_frac
+            self._vmax_slider.blockSignals(True)
+            self._vmax_slider.setValue(int(self._vmin_frac * 1000))
+            self._vmax_slider.blockSignals(False)
+        self._vmax_frac = new_frac
+        self._redraw()
+
+    def _reset_intensity(self):
+        self._vmin_frac = 0.0
+        self._vmax_frac = 1.0
+        self._vmin_slider.blockSignals(True)
+        self._vmax_slider.blockSignals(True)
+        self._vmin_slider.setValue(0)
+        self._vmax_slider.setValue(1000)
+        self._vmin_slider.blockSignals(False)
+        self._vmax_slider.blockSignals(False)
         self._redraw()
 
     def _on_export(self):
